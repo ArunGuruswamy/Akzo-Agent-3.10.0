@@ -4,7 +4,7 @@
 
 One GitHub Copilot custom agent, **`akzo-master-sdd`**, for spec-driven development in any registered repository. It discovers the repository's architecture, maps every requirement of a refined PBI (plus your supporting documents) to existing code as **EXISTING / REUSABLE / EXTEND / NEW / UNKNOWN**, writes `spec.md` and `plan.md`, implements test first, and validates build, tests, and analyzers. It stops for your approval after the gap map, the spec, and the plan. It runs in Copilot Chat in **VS Code** and **Visual Studio 2026** (18.5+ for user-level agents), and only when you select it. Nothing in the agent is tied to a particular project, framework, or organization: stack-specific rules apply only when the repository's architecture index detects that stack.
 
-> **Release candidate.** Version 3.4.1 is a release candidate. Corporate readiness is **NOT VERIFIED**: see [corporate-security-report.html](corporate-security-report.html) for what was tested, the limitations, and the approvals still required.
+> **Release candidate.** Version 3.5.0 is a release candidate. Corporate readiness is **NOT VERIFIED**: see [corporate-security-report.html](corporate-security-report.html) for what was tested, the limitations, and the approvals still required.
 >
 > **Known limitation:** The developer's authorization is stored in `%USERPROFILE%\.akzo-agent\authorizations.json`. Any process running as that user, including a model with file-edit or terminal tools, can write that file directly. The `authorize` command asks the IDE for confirmation, but the helper cannot tell a command from a direct file write, so the developer's approval is enforced by the IDE's prompts and the agent's instructions, and instructions alone do not enforce approval. Where approval must be enforced, an administrator places a `policy.json` that users cannot write, with `allowDeveloperAttestation` set to `false`: developer statements are then ignored and only listed repositories are processed. G8 reports a developer statement as NOT VERIFIED in every case.
 
@@ -27,8 +27,8 @@ Command-line equivalents (no window): `scripts\Install-MasterAgent.ps1 -Action I
 ## Chat commands
 | You type | Mode | What happens |
 |----------|------|--------------|
-| `Start Development` | Gated (default) | Dialogs for PBI + supporting documents, then the run with stops at G2 (gap map), G3 (spec), G4 (plan) |
-| `start` | Gated | Takes the newest item in the inbox (after `Start-Development.cmd`) |
+| `Start Development`, `New Development`, `Start Implementation` | Gated (default) | Always a **fresh task**: dialogs for PBI + supporting documents, branch decision, then the run with stops at G2 (gap map), G3 (spec), G4 (plan). Never resumes the previous PBI |
+| `start` | Gated | Takes the item `Start-Development.cmd` just queued; otherwise asks: a) new development, b) modify an existing implementation, c) resume an existing PBI |
 | `develop 305912` | Gated | Same, for a PBI already in the tasks folder |
 | `implement PBI 305912` | Gated | Finds the PBI (task folder or inbox), uses the open workspace as the repository when it is registered, loads repository memory, then as `develop` |
 | `implement PBI 305912 in Auto Mode` | Auto | The whole PBI in one go inside the scope you authorize: analysis, gap map, spec, plan, test-first implementation, tests, analyzers/Sonar, memory update, G8 security gate, handover. Stops only for business ambiguity, destructive or production actions, permission changes, new dependencies, and anything outside the scope |
@@ -37,6 +37,7 @@ Command-line equivalents (no window): `scripts\Install-MasterAgent.ps1 -Action I
 | `attach C:\docs\notes.docx to 305912` | — | Adds supporting documents to an existing task |
 | `review and align 305912` | Align | Code exists: compares it with siblings and the gap map, fixes deviations, validates |
 | `debug <symptom>` | Debug | Root-cause fix with a regression test |
+| `modify 305912` | Modify | Snapshots spec, plan, and statuses into the task history, takes in the change, and reopens the gates for the changed parts |
 | `resume 305912` | Resume | Continues from the first gate neither approved nor waived, or from "Remaining" in plan.md |
 
 ## How a PBI is analyzed
@@ -48,6 +49,11 @@ Command-line equivalents (no window): `scripts\Install-MasterAgent.ps1 -Action I
 6. **Implement and validate:** test first; build → test → analyzers/Sonar → fix until 0 build errors, 0 newly failing tests, 0 new issues in changed files; never suppressions or skipped tests.
 6a. **SonarQube and code rules:** code is written to a built-in rule set (complexity, unused code, error handling, literals, security, resources, async) and checked against the project's Sonar quality gate using the strongest source available: SonarQube MCP tools in chat, read-only server queries through the helper (gate, issues, hotspots, coverage, duplication, rule details; token from `SONAR_TOKEN`, never shown), Sonar analyzers in the build, or SonarQube for IDE. Coverage of changed lines is measured from the repository's own Cobertura or LCOV reports. Without a server it uses stated defaults (0 new issues, hotspots listed for review, changed-line coverage ≥ 80%, new duplication ≤ 3%). It never uploads an analysis unless asked. Setup: [installation-guide.html#sonar](installation-guide.html#sonar).
 7. **Handover (G5):** requirement → class → acceptance criterion → evidence table, baseline vs final counts, open questions, proposed commit message. It never commits or pushes.
+
+## Each PBI is its own task (3.5.0)
+- Task folder `<tasks>\<repo-id>\<PBI-ID>\` and a spec folder unique per work item: `<specsDir>\<id>-<title>\` (e.g. `300186-create-order-export\spec.md`). Approvals, gate statuses, plan progress, and completion belong to that task only; a folder that belongs to another PBI is never reused.
+- Before any file is created in the repository the agent shows repository, branch, HEAD, and uncommitted changes and asks: a) create a new feature branch (`feature/<id>-<title>`, recommended on a shared branch or one that belongs to another PBI; the base branch is confirmed, an existing name is detected), b) continue on the current branch, c) select an existing branch. It never stashes, resets, or discards changes; switching with uncommitted changes needs your agreement.
+- A new PBI reuses architecture memory (after checking its evidence is current), not another PBI's progress; earlier tasks that look like the same feature are listed so the gap map checks whether the requirement is already satisfied instead of reimplementing it.
 
 ## Repository memory (3.4.0)
 Per repository, under `%USERPROFILE%\.akzo-agent\maps\<repo-id>\`, never mixed between repositories and never uploaded:
@@ -97,7 +103,7 @@ The agent's rules live only in its agent file. Nothing is written to `AGENTS.md`
 
 ## Develop and test this package
 - `scripts\make-release.ps1` — builds `Akzo-Agent-<version>.zip` with `release-manifest.json` and a `.sha256` file. `scripts\ab-bench.ps1` — interleaved timing of up to three helper versions on one repository (results in `benchmark\interleaved-3.4.1.md`). `scripts\benchmark.ps1` — timing of the previous package against this one on a generated repository (results in `benchmark\results-3.4.1.md`; single-run cold and warm figures are superseded by the interleaved ones; model tokens and Copilot interactions are not measurable here).
-- `scripts\test.ps1` — 264 checks in a temporary profile (repository memory on C#, Angular, and Python fixtures, incremental indexing, facts, retrieval, G8 preflight, command guard, scanning, policy, purge, release integrity, Sonar against a local stand-in server, and changed-line coverage included): static agent checks (incl. project-agnostic wording, gates, gap map), install, upgrade/migration, rerun, repair, rollback, AddRepo with first discovery, memory-leak cleanup, VS Code settings and auto-approve rule, intake, `pick` with supporting documents, `attach`, `role`, manifest, duplicate/missing/unsupported/second-primary detection, `.docx`/`.xlsx` extraction and cache reuse, change detection, interrupted-processing recovery, architecture index (roles, refresh on new commit, per-repository isolation), launchers, uninstall. Never touches your real profile.
+- `scripts\test.ps1` — 287 checks in a temporary profile (repository memory on C#, Angular, and Python fixtures, incremental indexing, facts, retrieval, G8 preflight, command guard, scanning, policy, purge, release integrity, Sonar against a local stand-in server, and changed-line coverage included): static agent checks (incl. project-agnostic wording, gates, gap map), install, upgrade/migration, rerun, repair, rollback, AddRepo with first discovery, memory-leak cleanup, VS Code settings and auto-approve rule, intake, `pick` with supporting documents, `attach`, `role`, manifest, duplicate/missing/unsupported/second-primary detection, `.docx`/`.xlsx` extraction and cache reuse, change detection, interrupted-processing recovery, architecture index (roles, refresh on new commit, per-repository isolation), launchers, uninstall. Never touches your real profile.
 - `scripts\test-gui.ps1` — drives the real windows through the `.cmd` launchers (PBI dialog, multi-select supporting dialog, setup window, uninstall confirmation) in a temporary profile. Needs a desktop session.
 
 ## Ownership and licensing

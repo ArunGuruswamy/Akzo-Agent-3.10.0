@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   Builds the release package: Akzo-Agent-<version>.zip with release-manifest.json (SHA-256 of every file) inside, and
   Akzo-Agent-<version>.zip.sha256 beside it.
@@ -22,7 +22,7 @@ $Source = Split-Path -Parent $PSScriptRoot
 $version = (Get-Content (Join-Path $Source 'VERSION') -TotalCount 1).Trim()
 $zip = Join-Path $OutDir "Akzo-Agent-$version.zip"
 if (Test-Path $zip) { throw "$zip already exists; remove it or choose -OutDir (a release is never overwritten silently)." }
-$files = @(Get-ChildItem $Source -Recurse -File -Force | Where-Object { $_.FullName -notmatch '\\\.git\\' -and $_.Name -ne 'release-manifest.json' } | Sort-Object FullName)
+$files = @(Get-ChildItem $Source -Recurse -File -Force | Where-Object { $_.FullName -notmatch '\\\.git\\' -and $_.Name -ne 'release-manifest.json' -and $_.FullName.Substring($Source.Length + 1) -notmatch '^release\\' } | Sort-Object FullName)   # earlier published releases (release\) are not part of a package
 $entries = @($files | ForEach-Object { [pscustomobject][ordered]@{ path = $_.FullName.Substring($Source.Length + 1) -replace '\\', '/'; sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash; bytes = $_.Length } })
 $manifest = [pscustomobject][ordered]@{
     product = 'Akzo SDD Agent'; maintainer = 'Arun RG'; version = $version; built = (Get-Date).ToString('s'); builtBy = "$env:USERDOMAIN\$env:USERNAME"

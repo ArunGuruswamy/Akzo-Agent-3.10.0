@@ -39,12 +39,12 @@ footer{max-width:960px;margin:0 auto;padding:0 16px 32px;color:var(--muted);font
 <body>
 <header><div>
   <h1>Akzo SDD agent for GitHub Copilot</h1>
-  <p style="font-weight:600;margin:0 0 6px">Akzo Master SDD Agent v3.4.1 (release candidate) — Developed and maintained by Arun RG</p>
+  <p style="font-weight:600;margin:0 0 6px">Akzo Master SDD Agent v3.5.0 (release candidate) — Developed and maintained by Arun RG</p>
   <p>Install, configure, and use the <code>akzo-master-sdd</code> custom agent in VS Code and Visual Studio 2026. Everything below matches the scripts in this repository.</p>
 </div></header>
 <nav aria-label="Sections">
   <a href="#prereq">Prerequisites</a><a href="#isolation">Activation &amp; isolation</a><a href="#install">Install</a><a href="#vscode">VS Code</a><a href="#vs">Visual Studio</a>
-  <a href="#repos">Repositories</a><a href="#security">Security (G8)</a><a href="#memory">Memory &amp; Auto Mode</a><a href="#sonar">SonarQube</a><a href="#quick">Quick start</a><a href="#task">Start a task</a><a href="#use">Prompts</a><a href="#access">Permissions</a><a href="#storage">Storage</a><a href="#git">Git Changes</a>
+  <a href="#repos">Repositories</a><a href="#security">Security (G8)</a><a href="#workflow">Tasks &amp; branches</a><a href="#memory">Memory &amp; Auto Mode</a><a href="#sonar">SonarQube</a><a href="#quick">Quick start</a><a href="#task">Start a task</a><a href="#use">Prompts</a><a href="#access">Permissions</a><a href="#storage">Storage</a><a href="#git">Git Changes</a>
   <a href="#update">Update &amp; uninstall</a><a href="#trouble">Troubleshooting</a><a href="#evaluation">Evaluation</a>
 </nav>
 <main>
@@ -202,6 +202,18 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\.akzo-agen
     <li>Memory and task folders are restricted to your account, SYSTEM, and Administrators. They are not encrypted; keep <code>tasksDir</code> out of synchronized folders.</li>
   </ul>
   <p class="muted">Package report with the controls, test evidence, endpoint-protection findings during development, limitations, and required approvals: <code>corporate-security-report.html</code> in the package. Deployment in an organization still needs those approvals.</p>
+</section>
+
+<section id="workflow">
+  <h2>Fresh tasks, branches, modify and resume</h2>
+  <ul>
+    <li><b>Start Development</b>, <b>New Development</b>, or <b>Start Implementation</b> always starts a fresh task: the file dialog for the refined PBI, then the optional dialog for supporting documents. It never resumes the previous PBI. If the dialog cannot open, the agent reports the error and offers a file path or <code>Start-Development.cmd</code> instead; it never skips intake.</li>
+    <li>When a request is unclear, the agent asks once: a) start new development, b) modify an existing implementation, c) resume an existing PBI. <code>resume &lt;PBI&gt;</code> and <code>modify &lt;PBI&gt;</code> go straight to that task.</li>
+    <li><b>Branch:</b> before any file is created or code changed, the agent shows repository, branch, HEAD, and uncommitted changes, and asks: a) create a new feature branch (<code>feature/&lt;id&gt;-&lt;title&gt;</code>, lowercase with hyphens; recommended on main/develop or a branch that belongs to another PBI; you confirm the base branch), b) continue on the current branch, c) select an existing branch. Creating or switching a branch always asks for your confirmation in the IDE. Nothing is stashed, reset, or discarded; switching with uncommitted changes needs your agreement (git carries them along and refuses if they would be overwritten).</li>
+    <li><b>Specs:</b> one folder per work item, <code>&lt;specsDir&gt;\&lt;id&gt;-&lt;title&gt;\spec.md</code> and <code>plan.md</code>. Another PBI's folder is never reused (<code>SPEC_LOCATION_TAKEN</code>); resuming on a branch that lacks the PBI's spec stops with <code>WRONG_BRANCH</code>.</li>
+    <li><b>Modify:</b> the current spec, plan, PBI, inputs, and statuses are copied to <code>&lt;task&gt;\history\</code> first; then the changed parts go through the gates again.</li>
+    <li><b>Upgrading from 3.4.x:</b> existing tasks resume with their specs and approvals; for tasks without a recorded branch decision the agent reports that and asks before changing code.</li>
+  </ul>
 </section>
 
 <section id="memory">

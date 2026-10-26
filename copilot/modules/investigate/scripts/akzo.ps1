@@ -41,7 +41,7 @@
 #>
 param(
     [Parameter(Position = 0, Mandatory = $true)]
-    [ValidateSet('home', 'registry', 'state', 'inbox', 'pick', 'intake', 'attach', 'role', 'discover', 'task', 'graph', 'sonar', 'coverage', 'remember', 'forget', 'context', 'policy', 'authorize', 'guard', 'scan', 'security', 'purge')]
+    [ValidateSet('home', 'registry', 'state', 'inbox', 'pick', 'intake', 'attach', 'role', 'discover', 'task', 'graph', 'sonar', 'coverage', 'remember', 'forget', 'context', 'policy', 'authorize', 'guard', 'scan', 'security', 'purge', 'branchinfo', 'branchcreate', 'branchuse', 'tasks', 'snapshot')]
     [string]$Command,
     [string]$Reference,       # authorize: the approval you hold (ticket, policy, or approver)
     [string]$Classification,  # authorize: public | internal | confidential (restricted needs an administrator policy)
@@ -55,6 +55,10 @@ param(
     [string]$ApprovedBy,      # guard: who approved a NEEDS_APPROVAL command
     [switch]$Confirmed,       # purge: required, the deletion cannot be undone
     [switch]$IncludeTasks,    # purge: also delete the repository's task folders
+    [string]$Name,            # branchcreate / branchuse: the branch name
+    [string]$Base,            # branchcreate: the base branch the developer confirmed
+    [switch]$AllowDirty,      # branchcreate / branchuse: the developer agreed to switch with uncommitted changes (git never discards them)
+    [switch]$Resume,          # intake: the developer chose to resume / modify an existing task (without it an existing task id is reported, not reused)
     [string]$Type,         # remember: fact type
     [string]$Text,         # remember: the fact; forget: the reason
     [string]$Evidence,     # remember: "path:line;path:line" (repo-relative)
@@ -1108,10 +1112,143 @@ function Find-TaskDir([string]$workItem, [string]$repoId) {
     $hits[0]
 }
 
+# ---- Task, spec-location, and branch helpers (3.5.0) -----------------------------------------------------------
+function ConvertTo-Slug([string]$s, [int]$max = 50) {   # lower case, Git-safe, hyphens
+    $x = ("$s").ToLowerInvariant() -replace '[^a-z0-9]+', '-' -replace '^-+|-+$', ''
+    if ($x.Length -gt $max) { $x = $x.Substring(0, $max) -replace '-+$', '' }
+    $x
+}
+function Get-IdPart([string]$id) { ConvertTo-Slug $id 40 }   # the whole id, so PBI-15 stays pbi-15
+function Get-SpecFolderName([string]$id, [string]$title) {   # 300186 + "Create paint system" -> 300186-create-paint-system
+    $i = Get-IdPart $id; $s = ConvertTo-Slug $title 50
+    if ($s) { "$i-$s" } else { $i }
+}
+function Get-BranchName([string]$id, [string]$title) { 'feature/' + (Get-SpecFolderName $id $title) }
+function Get-PbiTitle([string]$pbiFile) {   # first heading of the refined PBI without its number
+    if (-not $pbiFile -or -not (Test-Path -LiteralPath $pbiFile)) { return '' }
+    $h = "$(Get-Content -LiteralPath $pbiFile -TotalCount 20 -Encoding UTF8 | Where-Object { $_ -match '^\s*#+\s*\S' } | Select-Object -First 1)" -replace '^\s*#+\s*', ''
+    ($h -replace '(?i)^\s*(PBI|WI|US)?[-# ]?\d{3,}\s*[-:.]?\s*', '').Trim()
+}
+function Get-RepoTasks([string]$repoId) {   # every task folder of one repository, with its remembered state (task.json)
+    $root = Join-Path $TasksDir $repoId
+    foreach ($d in @(Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue)) {
+        $f = Join-Path $d.FullName 'task.json'
+        $j = if (Test-Path -LiteralPath $f) { try { Get-Content -LiteralPath $f -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $null } } else { $null }
+        [pscustomobject]@{ id = $d.Name; dir = $d.FullName; json = $j; hasPbi = (Test-Path -LiteralPath (Join-Path $d.FullName 'refined-pbi.md')); modified = $d.LastWriteTime }
+    }
+}
+function Get-StatusLine([string]$file, [string]$key) {   # 'Status' or 'Gap map' line of a spec/plan; templates (with '|') read as not started
+    if (-not $file -or -not (Test-Path -LiteralPath $file)) { return 'no file' }
+    $l = (Select-String -LiteralPath $file -Pattern "^${key}:" -ErrorAction SilentlyContinue | Select-Object -First 1).Line
+    if ($l -and $l -notmatch '\|') { ($l -replace "^${key}:\s*").Trim() } else { 'not started' }
+}
+function Get-TaskSummary($t) {
+    $sd = "$($t.json.specDir)"; if (-not $sd) { $sd = $t.dir }
+    $plan = Get-StatusLine (Join-Path $sd 'plan.md') 'Status'
+    [pscustomobject][ordered]@{
+        id = $t.id; title = "$($t.json.title)"; gapMap = (Get-StatusLine (Join-Path $sd 'spec.md') 'Gap map'); spec = (Get-StatusLine (Join-Path $sd 'spec.md') 'Status')
+        plan = $plan; completed = [bool]($plan -match '(?i)^done'); branch = "$($t.json.branch)"; specDir = $sd; modified = $t.modified.ToString('yyyy-MM-dd HH:mm')
+    }
+}
+function Update-TaskJson([string]$dir, [hashtable]$set) {   # merge keys into task.json; other keys are kept
+    $f = Join-Path $dir 'task.json'
+    $o = if (Test-Path -LiteralPath $f) { try { Get-Content -LiteralPath $f -Raw -Encoding UTF8 | ConvertFrom-Json } catch { [pscustomobject]@{} } } else { [pscustomobject]@{} }
+    foreach ($k in $set.Keys) { $o | Add-Member -NotePropertyName $k -NotePropertyValue $set[$k] -Force }
+    Write-TextAtomic $f ($o | ConvertTo-Json -Depth 4)
+}
+# A spec/plan folder belongs to one work item. Taken when another task remembers it, or when it already holds work
+# (not the untouched templates) that does not mention this work item. Returns the owner, or '' when it is free.
+function Find-SpecOwner([string]$specDir, [string]$repoId, [string]$selfId) {
+    $norm = { param($p) ("$p" -replace '/', '\').TrimEnd('\').ToLowerInvariant() }
+    $want = & $norm $specDir
+    foreach ($t in Get-RepoTasks $repoId) { if ($t.id -ne $selfId -and $t.json.specDir -and (& $norm $t.json.specDir) -eq $want) { return $t.id } }
+    foreach ($n in 'spec', 'plan') {
+        $f = Join-Path $specDir "$n.md"
+        if (-not (Test-Path -LiteralPath $f)) { continue }
+        $tmpl = (Get-FileHash -LiteralPath (Join-Path $ModulesDir "$n\assets\$n.md")).Hash
+        if ((Get-FileHash -LiteralPath $f).Hash -eq $tmpl) { continue }
+        $head = (Get-Content -LiteralPath $f -TotalCount 6 -Encoding UTF8) -join "`n"
+        if ($head -notmatch "(?<![A-Za-z0-9])$([regex]::Escape($selfId))(?![A-Za-z0-9])") { return '(existing files that no task has recorded)' }
+    }
+    ''
+}
+function Get-TaskOverlap([string]$repoId, [string]$selfId, [string]$pbiFile) {   # other tasks of this repository that look like the same feature
+    $read = { param($f, $title) $x = ''; if ($f -and (Test-Path -LiteralPath $f)) { $x = (Get-Content -LiteralPath $f -TotalCount 25 -Encoding UTF8) -join ' '; if ($x.Length -gt 700) { $x = $x.Substring(0, 700) } }; @(Get-Tokens "$title $x") }
+    $mine = & $read $pbiFile (Get-PbiTitle $pbiFile)
+    if ($mine.Count -lt 3) { return @() }
+    $out = New-Object Collections.Generic.List[object]
+    foreach ($t in @(Get-RepoTasks $repoId | Where-Object { $_.id -ne $selfId -and $_.hasPbi } | Sort-Object modified -Descending | Select-Object -First 30)) {
+        $theirs = & $read (Join-Path $t.dir 'refined-pbi.md') "$($t.json.title)"
+        $shared = @($mine | Where-Object { $theirs -contains $_ })
+        $union = @($mine + $theirs | Select-Object -Unique).Count
+        if ($shared.Count -ge 3 -and $union -gt 0 -and ($shared.Count / $union) -ge 0.25) {
+            $s = Get-TaskSummary $t
+            $out.Add([pscustomobject][ordered]@{ id = $t.id; title = $s.title; plan = $s.plan; completed = $s.completed; branch = $s.branch; similarity = [math]::Round($shared.Count / $union, 2); sharedTerms = ($shared | Select-Object -First 8) -join ', ' })
+        }
+    }
+    @($out | Sort-Object similarity -Descending | Select-Object -First 5)
+}
+$IntegrationBranch = '^(main|master|develop|development|dev|trunk|staging|production|prod|qa|uat|test|integration.*|releases?[/-].*|hotfix[/-].*)$'
+function Get-BranchInfo($r, [string]$pbiId, [string]$title) {
+    $root = $r.path
+    $cur = "$(Invoke-Quiet git -C $root symbolic-ref --short -q HEAD)"   # empty when detached
+    $head = "$(Invoke-Quiet git -C $root log -1 '--format=%h %s')"
+    $dirty = @(Invoke-Quiet git -C $root -c core.quotepath=off status --porcelain=v1)
+    $refs = @(Invoke-Quiet git -C $root for-each-ref '--format=%(refname)' refs/heads refs/remotes)
+    $local = @($refs | Where-Object { $_ -like 'refs/heads/*' } | ForEach-Object { $_.Substring(11) })
+    $remote = @($refs | Where-Object { $_ -like 'refs/remotes/*' -and $_ -notlike '*/HEAD' } | ForEach-Object { $_.Substring(13) })
+    $remoteHead = "$(Invoke-Quiet git -C $root symbolic-ref --short -q refs/remotes/origin/HEAD)" -replace '^origin/', ''
+    $bases = @(@($remoteHead) + 'main', 'master', 'develop', 'development' | Where-Object { $_ -and ($local -contains $_ -or $remote -contains "origin/$_") } | Select-Object -Unique)
+    $tasks = @(Get-RepoTasks $r.id)
+    $recordedFor = @($tasks | Where-Object { $cur -and "$($_.json.branch)" -eq $cur } | ForEach-Object { $_.id })
+    $mine = $tasks | Where-Object { $_.id -eq $pbiId } | Select-Object -First 1
+    $forThis = "$($mine.json.branch)"
+    $isIntegration = [bool]($cur -match $IntegrationBranch)
+    $proposed = ''; $exists = $false; $alternative = ''
+    if ($pbiId -or $title) {
+        $proposed = Get-BranchName $pbiId $title
+        $exists = ($local -contains $proposed) -or ($remote | Where-Object { $_ -like "*/$proposed" })
+        if ($exists) { for ($n = 2; $n -lt 20; $n++) { $alt = "$proposed-$n"; if (-not ($local -contains $alt) -and -not ($remote | Where-Object { $_ -like "*/$alt" })) { $alternative = $alt; break } } }
+    }
+    $others = @($recordedFor | Where-Object { $_ -ne $pbiId })
+    $recommend = 'new'; $reason = ''
+    if (-not $cur) { $reason = 'HEAD is detached; commits made here belong to no branch' }
+    elseif ($isIntegration) { $reason = "'$cur' is a shared integration branch" }
+    elseif ($others.Count) { $reason = "'$cur' is recorded for another PBI ($($others -join ', '))" }
+    elseif ($forThis -and $forThis -eq $cur) { $recommend = 'current'; $reason = "'$cur' is already recorded for this PBI" }
+    else { $recommend = 'current'; $reason = "'$cur' is not a shared branch and is not recorded for another PBI" }
+    [pscustomobject][ordered]@{
+        repo = $r.id; path = $root; branch = $(if ($cur) { $cur } else { '(detached HEAD)' }); head = $head; commits = [bool]$head
+        uncommitted = $dirty.Count; uncommittedPaths = @($dirty | Select-Object -First 15)
+        integrationBranch = $isIntegration; recordedForPbis = $recordedFor; recordedForThisPbi = $forThis
+        recommend = $recommend; reason = $reason
+        defaultBase = $(if ($bases.Count) { $bases[0] } else { '' }); baseCandidates = $bases; baseNote = 'Confirm the base branch with the developer; do not assume it.'
+        proposedBranch = $proposed; proposedExists = [bool]$exists; alternativeBranch = $alternative
+        localBranches = @($local | Select-Object -First 40); remoteBranches = @($remote | Select-Object -First 40)
+        options = @('a) create a new feature branch for this PBI', 'b) continue on the current branch', 'c) select an existing branch')
+    }
+}
+function Invoke-GitSwitch([string]$root, [string[]]$gitArgs) {   # git writes "Switched to ..." to stderr, which Windows PowerShell 5.1 turns into an error under 'Stop'
+    $keep = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    try { $o = & git -C $root switch @gitArgs 2>&1 | Out-String } finally { $ErrorActionPreference = $keep }
+    $o
+}
+function Test-BranchName([string]$n) {
+    if ($n -notmatch '^[a-z0-9][a-z0-9._/-]{0,80}$' -or $n -match '\.\.|//|/$|\.lock$|-$') { return $false }
+    $keep = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    try { & git check-ref-format --branch $n 2>&1 | Out-Null; $ok = ($LASTEXITCODE -eq 0) } finally { $ErrorActionPreference = $keep }
+    $ok
+}
 # pick: choose a requirement document (file dialog unless -Source), convert it, and drop it in the inbox as
 # <inbox>\<name>\refined-pbi.md with the original under source\. The selected file itself is never changed.
+function Out-PickFailed([string]$why) {
+    [pscustomobject][ordered]@{ status = 'PICK_FAILED'; error = $why; inbox = $InboxDir
+        alternatives = @('give me the full path of the refined PBI file and I will run: pick -Source "<path>" [-Supporting "<path>;<path>"]', 'double-click Start-Development.cmd in the Akzo Master Agent folder (same two dialogs)', "drop the file in $InboxDir and say start") } | ConvertTo-Json -Depth 3
+    exit 0
+}
 if ($Command -eq 'pick') {
     if (-not $Source) {
+      try {
         if ([Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') { throw 'The file dialog needs an STA thread: run with Windows PowerShell (powershell.exe) or pass -Source.' }
         Add-Type -AssemblyName System.Windows.Forms
         $dlg = New-Object Windows.Forms.OpenFileDialog
@@ -1129,10 +1266,11 @@ if ($Command -eq 'pick') {
                 if ($more.ShowDialog($owner) -eq [Windows.Forms.DialogResult]::OK) { $Supporting = $more.FileNames -join ';' }
             }
         } finally { $owner.Dispose() }
-        if (-not $ok) { [pscustomobject]@{ status = 'CANCELLED'; inbox = $InboxDir } | ConvertTo-Json; exit 0 }
+        if (-not $ok) { [pscustomobject]@{ status = 'CANCELLED'; inbox = $InboxDir; next = 'Nothing was selected and nothing was created. Ask whether to try again, give a file path, or stop.' } | ConvertTo-Json; exit 0 }
         $Source = $dlg.FileName
+      } catch { Out-PickFailed "$($_.Exception.Message)" }
     }
-    if (-not (Test-Path -LiteralPath $Source -PathType Leaf)) { throw "File not found: $Source" }
+    if (-not (Test-Path -LiteralPath $Source -PathType Leaf)) { Out-PickFailed "File not found: $Source" }
     $pbiItem = (Get-Item -LiteralPath $Source)
     $text = (ConvertTo-PbiText $pbiItem.FullName).Trim()
     if (($text -replace '\s', '').Length -lt 40) { throw "'$($pbiItem.Name)' holds almost no text ($($text.Length) characters); choose the refined PBI document." }
@@ -1162,6 +1300,12 @@ if ($Command -eq 'intake') {
     if (-not $pbiSrc) { throw "Cannot tell which file in '$Source' is the refined PBI. Name it refined-pbi.md." }
     $dest = Join-Path $TasksDir "$Repo\$Id"
     $destPbi = Join-Path $dest 'refined-pbi.md'
+    if ((Test-Path -LiteralPath $destPbi) -and -not $Resume) {   # new development never silently resumes an existing task
+        $sum = Get-TaskSummary ([pscustomobject]@{ id = $Id; dir = $dest; json = $(try { Get-Content -LiteralPath (Join-Path $dest 'task.json') -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $null }); modified = (Get-Item -LiteralPath $dest).LastWriteTime })
+        $next = 2; while (Test-Path -LiteralPath (Join-Path $TasksDir "$Repo\$Id-$next")) { $next++ }
+        Out-Task 'TASK_EXISTS' ([ordered]@{ repo = $Repo; id = $Id; existing = $sum; suggestedNewId = "$Id-$next"
+                choices = @('resume this task (rerun intake with -Resume)', "modify it (snapshot first, then intake with -Resume)", "separate task (rerun intake with -Id $Id-$next)") }); exit 0
+    }
     if ((Test-Path -LiteralPath $destPbi) -and (Get-FileHash -LiteralPath $destPbi).Hash -ne (Get-FileHash -LiteralPath $pbiSrc).Hash) {
         throw "Task $Repo\$Id already has a different refined-pbi.md ($destPbi). Edit that file and resume, or use another PBI number."
     }
@@ -1181,7 +1325,7 @@ if ($Command -eq 'intake') {
             New-Item -ItemType Directory -Force -Path (Split-Path $to) | Out-Null; Copy-Item -LiteralPath $f.FullName $to
         }
     }
-    if ($Title -and -not $Feature) { $Feature = Get-FeatureName $Title }
+    if (-not $Feature) { $Feature = Get-SpecFolderName $Id $Title }   # <id>-<title>: unique per work item
     $Command = 'task'
 }
 
@@ -1463,6 +1607,10 @@ if ($Command -eq 'remember') {
     if ($t.Length -lt 10 -or $t.Length -gt 800) { throw '-Text must be one factual statement of 10 to 800 characters.' }
     $secret = Find-Secret "$t $Evidence"
     if ($secret) { throw "Refused: the fact looks like it contains a secret ($secret). Record where the value is configured, never the value." }
+    foreach ($tid in @(Get-RepoTasks $r.id | ForEach-Object { $_.id })) {   # PBI-specific text belongs to the task, not to repository memory
+        if ($tid.Length -ge 3 -and $t -match "(?<![A-Za-z0-9])$([regex]::Escape($tid))(?![A-Za-z0-9])") { throw "Refused: the fact names work item '$tid'. Repository memory holds architecture knowledge (structure, conventions, reusable components, commands); requirements, approvals, and progress of a PBI stay in its task." }
+    }
+    if ($t -match '(?i)\b(PBI|work item|WI|user story)\s*[-#:]?\s*\d{3,}') { throw 'Refused: the fact names a work item. Repository memory holds architecture knowledge, not PBI requirements, approvals, or progress.' }
     if (Find-InstructionText $t) { throw 'Refused: the fact reads like an instruction to the agent. Memory holds verified statements about the code, never instructions.' }
     $blobs = Get-FileBlobs $r.path
     $ev = @(foreach ($e in @("$Evidence" -split ';' | Where-Object { $_.Trim() })) {
@@ -1755,6 +1903,76 @@ if ($Command -eq 'coverage') {
     exit 0
 }
 
+# branchinfo: read-only. Repository, branch, HEAD, uncommitted changes, recorded relationship to PBIs, and the options.
+if ($Command -eq 'branchinfo') {
+    $r = Resolve-Repo $Repo; $null = Assert-Preflight $r
+    $ttl = if ($Title) { $Title } elseif ($Id) { $td = Get-RepoTasks $r.id | Where-Object { $_.id -eq $Id } | Select-Object -First 1; if ($td.json.title) { "$($td.json.title)" } elseif ($td) { Get-PbiTitle (Join-Path $td.dir 'refined-pbi.md') } else { '' } } else { '' }
+    Get-BranchInfo $r $Id $ttl | ConvertTo-Json -Depth 4
+    exit 0
+}
+
+# branchcreate / branchuse: act only after the developer chose (-Confirmed). git switch never discards uncommitted
+# changes (it refuses when they would be overwritten); nothing is stashed, reset, or cleaned.
+if ($Command -in 'branchcreate', 'branchuse') {
+    if (-not $Confirmed) { throw "$Command changes the working tree's branch: show branchinfo, let the developer choose, then rerun with -Confirmed." }
+    if (-not $Id) { throw "$Command needs -Id <PBI> (the task must exist: run intake first)." }
+    $r = Resolve-Repo $Repo; $null = Assert-Preflight $r
+    $dir = Find-TaskDir $Id $r.id
+    $dirty = @(Invoke-Quiet git -C $r.path -c core.quotepath=off status --porcelain=v1)
+    $refs = @(Invoke-Quiet git -C $r.path for-each-ref '--format=%(refname)' refs/heads refs/remotes)
+    $local = @($refs | Where-Object { $_ -like 'refs/heads/*' } | ForEach-Object { $_.Substring(11) })
+    $remote = @($refs | Where-Object { $_ -like 'refs/remotes/*' -and $_ -notlike '*/HEAD' } | ForEach-Object { $_.Substring(13) })
+    $before = "$(Invoke-Quiet git -C $r.path symbolic-ref --short -q HEAD)"
+    $baseHead = ''; $baseName = ''
+    if ($Command -eq 'branchcreate') {
+        if (-not $Name -or -not $Base) { throw 'branchcreate needs -Name <new branch> and -Base <the base branch the developer confirmed>.' }
+        if (-not (Test-BranchName $Name)) { throw "Branch name '$Name' must be lowercase, Git-safe, with hyphens, e.g. feature/300186-create-paint-system." }
+        if ($local -contains $Name -or ($remote | Where-Object { $_ -like "*/$Name" })) { throw "Branch '$Name' already exists. Choose another name (branchinfo suggests an alternative) or use branchuse." }
+        $start = if ($local -contains $Base) { $Base } elseif ($remote -contains "origin/$Base") { "origin/$Base" } else { throw "Base branch '$Base' was not found locally or on origin." }
+        if ($dirty.Count -and -not $AllowDirty) { throw "$($dirty.Count) uncommitted change(s) are present. Nothing was switched. Ask the developer; with their agreement rerun with -AllowDirty (git carries the changes along and refuses if they would be overwritten)." }
+        $baseName = $Base; $baseHead = "$(Invoke-Quiet git -C $r.path rev-parse --short $start)"
+        $msg = Invoke-GitSwitch $r.path @('-c', $Name, $start)
+        if ($LASTEXITCODE -ne 0) { throw "git could not create '$Name' from '$start' (nothing was changed): $($msg.Trim())" }
+        $decision = 'created'
+    } else {
+        if ($Name -and $Name -ne $before) {
+            if (-not ($local -contains $Name -or ($remote | Where-Object { $_ -like "*/$Name" }))) { throw "Branch '$Name' does not exist locally or on origin." }
+            if ($dirty.Count -and -not $AllowDirty) { throw "$($dirty.Count) uncommitted change(s) are present. Nothing was switched. Ask the developer; with their agreement rerun with -AllowDirty." }
+            $msg = Invoke-GitSwitch $r.path @($Name)
+            if ($LASTEXITCODE -ne 0) { throw "git could not switch to '$Name' (nothing was changed): $($msg.Trim())" }
+            $decision = 'selected'
+        } else { $decision = 'continued' }
+    }
+    $nowBranch = "$(Invoke-Quiet git -C $r.path symbolic-ref --short -q HEAD)"
+    Update-TaskJson $dir @{ branch = $nowBranch; branchDecision = $decision; baseBranch = $baseName; baseHead = $baseHead; branchFrom = $before; branchDecidedAt = (Get-Date).ToString('s'); branchHead = "$(Invoke-Quiet git -C $r.path rev-parse --short HEAD)" }
+    [pscustomobject][ordered]@{ status = 'BRANCH_READY'; decision = $decision; id = $Id; branch = $nowBranch; previousBranch = $before; base = $baseName; uncommittedKept = $dirty.Count; stashed = $false } | ConvertTo-Json
+    exit 0
+}
+
+# tasks: the tasks of a repository, with their own statuses (each PBI has its own; nothing is shared).
+if ($Command -eq 'tasks') {
+    $rid = if ($Repo) { (Resolve-Repo $Repo).id } else { $w = Get-WorkspaceRepo; if ($w) { $w } else { throw 'tasks needs -Repo <id> (no registered repository is the open workspace).' } }
+    $rows = @(Get-RepoTasks $rid | Where-Object { $_.hasPbi } | Sort-Object modified -Descending | Select-Object -First 40 | ForEach-Object { Get-TaskSummary $_ })
+    [pscustomobject][ordered]@{ repo = $rid; count = $rows.Count; inProgress = @($rows | Where-Object { -not $_.completed } | ForEach-Object { $_.id }); completed = @($rows | Where-Object { $_.completed } | ForEach-Object { $_.id }); tasks = $rows } | ConvertTo-Json -Depth 4
+    exit 0
+}
+
+# snapshot: copy a task's spec, plan, PBI, inputs, and state into history\ before they are modified.
+if ($Command -eq 'snapshot') {
+    if (-not $Id) { throw 'snapshot needs -Id <PBI>.' }
+    $dir = Find-TaskDir $Id $Repo
+    $j = try { Get-Content -LiteralPath (Join-Path $dir 'task.json') -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $null }
+    $sd = if ($j.specDir) { "$($j.specDir)" } else { $dir }
+    $why = ConvertTo-Slug $(if ($Text) { $Text } else { 'before-change' }) 40
+    $snap = Join-Path $dir ("history\{0}-{1}" -f (Get-Date).ToString('yyyyMMdd-HHmmss'), $why)
+    New-Item -ItemType Directory -Force -Path $snap | Out-Null
+    $copied = @(foreach ($f in @((Join-Path $sd 'spec.md'), (Join-Path $sd 'plan.md'), (Join-Path $dir 'refined-pbi.md'), (Join-Path $dir 'inputs.json'), (Join-Path $dir 'task.json'))) {
+            if (Test-Path -LiteralPath $f) { Copy-Item -LiteralPath $f (Join-Path $snap ([IO.Path]::GetFileName($f))) -Force; [IO.Path]::GetFileName($f) } })
+    $sum = Get-TaskSummary ([pscustomobject]@{ id = $Id; dir = $dir; json = $j; modified = (Get-Item -LiteralPath $dir).LastWriteTime })
+    [pscustomobject]@{ reason = $Text; at = (Get-Date).ToString('s'); statuses = $sum; files = $copied } | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $snap 'snapshot.json') -Encoding UTF8
+    [pscustomobject][ordered]@{ status = 'SNAPSHOT_SAVED'; id = $Id; folder = $snap; files = $copied; statuses = $sum } | ConvertTo-Json -Depth 4
+    exit 0
+}
 switch ($Command) {
     'inbox' {
         New-Item -ItemType Directory -Force -Path $InboxDir | Out-Null
@@ -1840,23 +2058,52 @@ switch ($Command) {
         if ($saved.specDir) { $artifacts = $saved.specDir }
         else {
             $specsDir = if ($r.cfg.specsDir) { $r.cfg.specsDir -replace '/', '\' } elseif ($RepoMode) { 'specs' } else { '' }
-            if ($r.cfg.specsDir -and -not $Feature) {   # repo convention: specs are named by feature, not PBI
-                $info.specsDir = Join-Path $r.path $specsDir
-                if (Test-Path -LiteralPath $pbi) { return Out-Task 'NEEDS_FEATURE' $info }
-            }
+            if ($r.cfg.specsDir) { $info.specsDir = Join-Path $r.path $specsDir }
+            if ($r.cfg.specsDir -and -not $Feature) { $Feature = Get-SpecFolderName $Id $(if ($Title) { $Title } else { Get-PbiTitle $pbi }) }   # unique per work item
             if ($Feature -and $Feature -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$') { throw "Feature folder '$Feature' must be a folder name (letters, digits, '.', '_', '-')." }
-            $artifacts = if ($specsDir) { Join-Path $r.path (Join-Path $specsDir $(if ($Feature) { $Feature } else { $Id })) } else { $dir }
+            $artifacts = if ($specsDir) { Join-Path $r.path (Join-Path $specsDir $(if ($Feature) { $Feature } else { Get-SpecFolderName $Id $(if ($Title) { $Title } else { Get-PbiTitle $pbi }) })) } else { $dir }
+            if ($specsDir) {   # one folder, one work item: never inherit another PBI's spec, plan, or approvals
+                $owner = Find-SpecOwner $artifacts $r.id $Id
+                if ($owner) {
+                    $info.specFolder = $artifacts; $info.owner = $owner
+                    $info.suggestedFeature = Get-SpecFolderName $Id $(if ($Title) { $Title } else { Get-PbiTitle $pbi })
+                    return Out-Task 'SPEC_LOCATION_TAKEN' $info
+                }
+            }
         }
         $evidence = Join-Path $dir 'evidence'
         New-Item -ItemType Directory -Force -Path $dir, $evidence | Out-Null
         $created = @()
+        # A PBI whose spec lives on its recorded branch is never restarted from templates on another branch.
+        if ($saved.branch -and $artifacts -ne $dir -and (Test-Path -LiteralPath $pbi) -and -not (Test-Path -LiteralPath (Join-Path $artifacts 'spec.md'))) {
+            $curBranch = "$(Invoke-Quiet git -C $r.path symbolic-ref --short -q HEAD)"
+            if ($curBranch -ne "$($saved.branch)") {
+                $info.recordedBranch = "$($saved.branch)"; $info.currentBranch = $curBranch; $info.specFolder = $artifacts
+                $info.next = "This PBI's spec and plan are on '$($saved.branch)'. Ask, then switch with branchuse -Name $($saved.branch) -Confirmed, or record another branch decision. Nothing was created."
+                return Out-Task 'WRONG_BRANCH' $info
+            }
+        }
+        # Spec and plan inside the repository are created only after the branch decision is recorded (branchcreate /
+        # branchuse), so nothing lands on a branch the developer did not choose. Existing tasks resume unchanged.
+        if ($artifacts -ne $dir -and (Test-Path -LiteralPath $pbi) -and -not (Test-Path -LiteralPath (Join-Path $artifacts 'spec.md')) -and -not $saved.branchDecision) {
+            $ttl = if ($Title) { $Title } elseif ($saved.title) { "$($saved.title)" } else { Get-PbiTitle $pbi }
+            Update-TaskJson $dir @{ repo = $r.id; id = $Id; title = $ttl; specDir = $artifacts; agentVersion = $Version }   # remembers the chosen location
+            $info.specFolder = $artifacts
+            $info.branch = Get-BranchInfo $r $Id $ttl
+            $info.next = 'Show repository, branch, HEAD, and uncommitted changes; ask: a) new feature branch (recommended when branch.recommend is new), b) continue on the current branch, c) select an existing branch. Then run branchcreate or branchuse with -Confirmed, then task again.'
+            return Out-Task 'BRANCH_DECISION_NEEDED' $info
+        }
         if (Test-Path -LiteralPath $pbi) {   # spec/plan only once there is a requirement to work from
             New-Item -ItemType Directory -Force -Path $artifacts | Out-Null
             foreach ($t in 'spec', 'plan') {
                 $dest = Join-Path $artifacts "$t.md"
                 if (-not (Test-Path -LiteralPath $dest)) { Copy-Item (Join-Path $ModulesDir "$t\assets\$t.md") $dest; $created += $dest }   # never overwrite work
             }
-            if (-not $saved) { [pscustomobject]@{ repo = $r.id; id = $Id; title = $Title; specDir = $artifacts; agentVersion = $Version; startHead = "$(Invoke-Quiet git -C $r.path rev-parse HEAD)"; startedAt = (Get-Date).ToString('s') } | ConvertTo-Json | Set-Content -LiteralPath $stateFile -Encoding UTF8 }
+            $need = @{}   # merge: keys a branch decision or an earlier run already wrote are kept
+            foreach ($kv in @(@('repo', $r.id), @('id', $Id), @('title', $Title), @('specDir', $artifacts), @('agentVersion', $Version), @('startHead', "$(Invoke-Quiet git -C $r.path rev-parse HEAD)"), @('startedAt', (Get-Date).ToString('s')))) {
+                if ($kv[1] -and (-not $saved -or -not $saved.($kv[0]))) { $need[$kv[0]] = $kv[1] }
+            }
+            if ($need.Count) { Update-TaskJson $dir $need }
         }
         $base = Join-Path $dir 'refined-pbi.baseline.md'
         if ($Baseline) {
@@ -1885,6 +2132,7 @@ switch ($Command) {
         if ($null -ne $copied) { $info.copied = @($copied) }
         if ($null -ne $attached) { $info.attached = @($attached) }
         $info.title = $(if ($saved.title) { $saved.title } else { $Title })
+        $info.taskKind = $(if ($created.Count) { 'new' } else { 'existing' })
         $info.agentVersion = $Version
         $info.mode = $(if ($artifacts -eq $dir) { 'external' } else { 'repo' })
         $info.pbiState = $pbiState; $info.baseline = $base
@@ -1919,6 +2167,17 @@ switch ($Command) {
         $info.pbiFlag = Find-InstructionText ([IO.File]::ReadAllText($pbi))
         $info.graph = $(if (Test-Path -LiteralPath (Join-Path $AkzoHome "graphs\$($r.id)\graph.json")) { 'available' } else { 'none' })
         $info.sonar = Get-SonarSetup $r -Brief
+        $stateNow = [pscustomobject]@{ id = $Id; dir = $dir; json = $(try { Get-Content -LiteralPath $stateFile -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $null }); modified = (Get-Item -LiteralPath $dir).LastWriteTime }
+        $info.completed = (Get-TaskSummary $stateNow).completed
+        $selfBranch = "$($stateNow.json.branch)"
+        $others = @(Get-RepoTasks $r.id | Where-Object { $_.id -ne $Id -and "$($_.json.branch)" -and "$($_.json.branch)" -eq "$($info.git.branch)" } | ForEach-Object { $_.id })
+        $info.branchState = [pscustomobject][ordered]@{
+            current = "$($info.git.branch)"; head = "$($info.git.head)".Substring(0, [math]::Min(7, "$($info.git.head)".Length)); uncommitted = @($info.git.changes).Count
+            recordedForThisPbi = $selfBranch; decision = "$($stateNow.json.branchDecision)"
+            relation = $(if (-not $selfBranch) { 'no branch decision recorded for this PBI: run branchinfo and ask' } elseif ($selfBranch -ne "$($info.git.branch)") { "the PBI was recorded on '$selfBranch' but HEAD is on '$($info.git.branch)'" } else { 'matches the recorded branch' })
+            sharedWithOtherPbis = $others
+        }
+        $info.overlap = @(Get-TaskOverlap $r.id $Id $pbi)
         Out-Task 'READY' $info
     }
     'graph' {

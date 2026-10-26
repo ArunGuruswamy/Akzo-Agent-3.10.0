@@ -2,6 +2,27 @@
 
 Akzo SDD Agent — Developed and maintained by Arun RG. The version is in `VERSION`; `install.ps1 -Verify` shows the installed and available versions.
 
+## 3.5.0 — 2026-10-26
+Restores the complete development workflow. No feature was removed; the security controls are unchanged.
+
+**Why these behaviours were lost (root causes, checked against the shipped 3.0.0-3.4.1 packages)**
+- *File dialog and fresh tasks.* The dialog code (`pick`) is byte-identical in 3.2.0, 3.3.0, and 3.4.1; it was not broken. The agent's instructions made it unreachable for new work: plain "start" took the **newest inbox item** (after a finished PBI, that same PBI), step 2 said to "continue without asking", the `IN_INBOX` rule added in 3.4.0 took inbox items in "without asking", and "New Development" / "Start Implementation" were never entry phrases. A cancelled or failed dialog ended with a one-line note and no next step.
+- *Separate spec and plan, task isolation.* The spec folder was named from the title only (`CreatePaintSystem`, no PBI number), and spec/plan creation never overwrites. A second PBI with the same title therefore landed in the first one's folder and **inherited its approved spec, approved gap map, and "Done" plan** (reproduced: PBI 300999 reported the statuses of PBI 300186). Nothing checked whether a folder belonged to another work item.
+- *Branch selection and creation.* Never implemented in any version: the helper only read the branch name; the agent's only branch instructions were "inspect only" and "never switch branches".
+- *Gap analysis and approval gates.* Present since 3.2.0, but reachable only after intake; with the entry flow above, an old task (or its inherited approved statuses) let the agent skip straight to later steps.
+- *Memory versus PBI progress.* Repository memory accepted any statement, so PBI-specific progress could be stored as an architecture "fact" and shown to every later task.
+
+**Fixes**
+- Entry: "Start Development", "New Development", "Start Implementation" (no id) always start a fresh task with the file dialog; never the previous PBI or the newest inbox item. Ambiguous requests get one choice: a) new development, b) modify an existing implementation, c) resume an existing PBI. `resume <PBI>` loads that task directly.
+- `pick`: a dialog that cannot open or a missing file returns `PICK_FAILED` with the file-path and launcher alternatives; `CANCELLED` says nothing was created. The agent never skips intake.
+- `intake`: an existing task id is reported (`TASK_EXISTS` with resume / modify / separate-task choices and a suggested new id) instead of being reused; `-Resume` reuses it deliberately.
+- Unique spec folders: `<specsDir>/<id>-<title-slug>/` (e.g. `300186-create-order-export`); `-Feature` still sets another name. A folder recorded for, or holding the work of, another PBI is refused (`SPEC_LOCATION_TAKEN`). Resuming a PBI on a branch that lacks its spec returns `WRONG_BRANCH` instead of recreating it from templates.
+- Branches: new section 0a. `branchinfo` (read-only) shows repository, branch, HEAD, uncommitted changes, branch-to-PBI records, a proposed `feature/<id>-<title>` name with an existence check and an alternative, and base candidates to confirm. `branchcreate` / `branchuse` act only with `-Confirmed` after the developer chose; they refuse with uncommitted changes unless the developer agrees (`-AllowDirty`); nothing is stashed, reset, or discarded. In repository spec mode, no file is created in the repository until the decision is recorded (`BRANCH_DECISION_NEEDED`). Neither command is auto-approved.
+- Workflow: the 11 steps are explicit in the agent (intake, branch, investigation, gap map, spec, review, plan, consistency and approval, staged implementation, stage validation after every stage, final validation and handover). Auto Mode still produces gap map, spec, plan, and evidence, and still asks the branch decision unless its authorization names it.
+- Modify mode: `snapshot` copies spec, plan, PBI, inputs, and state into the task's `history\` before changes; gates are reopened for the changed parts.
+- Task isolation: `tasks` lists every task of a repository with its own statuses; `task` reports `taskKind`, `completed`, `branchState`, and `overlap` (earlier, possibly completed, tasks that look like the same feature, so the gap map checks them instead of reimplementing). `remember` refuses facts that name a work item: memory is architecture knowledge only.
+
+**Tests**: 287 checks (21 new) including fresh development after a completed PBI, memory reuse without task progress, dialog failure, branch choices with existing branches and uncommitted changes, unique and protected spec folders, wrong-branch resume, modify and resume, and a pre-3.5.0 task resuming unchanged; the window test now also cancels the agent's own dialog.
 ## 3.4.1 — 2026-10-26 (release candidate)
 Release candidate. Supersedes 3.4.0, which was packaged but never distributed and contained the three defects below; the 3.4.0 zip and its checksum were deleted on 2026-10-26 and this entry, with corporate-security-report.html, keeps the defect history. No new features. Corporate readiness: NOT VERIFIED (approvals listed in the report).
 

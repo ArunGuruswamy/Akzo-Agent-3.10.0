@@ -229,7 +229,7 @@ function Get-VSCodeBlock([string]$text) {
     $helper = Join-Path $ModulesDir 'investigate\scripts\akzo.ps1'
     # Only the helper, only its own commands, and no characters that could chain or substitute another command.
     $rx = '^(powershell|pwsh)(\.exe)? -NoProfile -ExecutionPolicy Bypass -File "?' + ([regex]::Escape($helper) -replace '\\\\', '[\\/]') +
-        '"? (home|registry|state|inbox|pick|intake|attach|role|discover|task|graph|sonar|coverage|context|remember|forget|policy|guard|scan|security)\b([^;&|`$<>\r\n"]|"[^"&|`$<>\r\n]*")*$'   # ';' only inside "..." (path lists)
+        '"? (home|registry|state|inbox|pick|intake|attach|role|discover|task|graph|sonar|coverage|context|remember|forget|policy|guard|scan|security|branchinfo|tasks|snapshot)\b([^;&|`$<>\r\n"]|"[^"&|`$<>\r\n]*")*$'   # ';' only inside "..." (path lists)
     $rest = [regex]::Replace($text, $BlockRx, '')
     $lines = @()
     if ($rest -notmatch '"chat\.tools\.terminal\.autoApprove"') {

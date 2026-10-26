@@ -10,8 +10,11 @@ param([switch]$KeepTemp)
 $ErrorActionPreference = 'Stop'
 $Source = Split-Path -Parent $PSScriptRoot
 $script:fail = 0; $script:pass = 0
+$script:clock = [Diagnostics.Stopwatch]::StartNew(); $script:lastCheck = 0.0; $script:slow = New-Object Collections.Generic.List[string]
 function Check([bool]$ok, [string]$what, [string]$detail = '') {   # $detail: the compared values, printed only on failure
-    if ($ok) { $script:pass++; Write-Output "PASS  $what" } else { $script:fail++; Write-Output "FAIL  $what"; if ($detail) { Write-Output "      detail: $detail" } }
+    $now = $script:clock.Elapsed.TotalSeconds; $took = $now - $script:lastCheck; $script:lastCheck = $now
+    $mark = if ($took -ge 15) { $script:slow.Add(("{0,6:N0}s  {1}" -f $took, $what)); " ({0:N0}s)" -f $took } else { '' }   # time since the previous check
+    if ($ok) { $script:pass++; Write-Output "PASS  $what$mark" } else { $script:fail++; Write-Output "FAIL  $what$mark"; if ($detail) { Write-Output "      detail: $detail" } }
 }
 function PS51([string]$scriptFile) {   # run a script under Windows PowerShell 5.1, as users will (name must not clash with a script's -File)
     $ErrorActionPreference = 'Continue'   # 5.1: under 'Stop', redirected native stderr would abort the suite
@@ -345,6 +348,9 @@ try {
     Check ($t.mode -eq 'external' -and -not (Test-Path "$fixture\specs")) 'resume: spec location is remembered; a later -RepoMode does not move it'
     New-Item -ItemType Directory -Force "$tasks\backend\PBI-15" | Out-Null
     Set-Content "$tasks\backend\PBI-15\REFINED-PBI.md" 'upper-case file name'
+    $t0 = Task -Id PBI-15 -RepoMode
+    Check ($t0.status -eq 'BRANCH_DECISION_NEEDED' -and -not (Test-Path "$fixture\specs") -and @($t0.branch.options).Count -eq 3 -and $t0.branch.uncommitted -ge 1 -and $t0.branch.branch) 'branch decision: before spec and plan go into the repository, the branch, HEAD, and uncommitted changes are shown and nothing is created'
+    $null = PS51 $helper branchuse -Repo backend -Id PBI-15 -Confirmed
     $t = Task -Id PBI-15 -RepoMode
     Check ($t.status -eq 'READY' -and $t.mode -eq 'repo' -and (Test-Path "$fixture\specs\PBI-15\spec.md") -and -not (Test-Path "$fixture\specs\PBI-15\refined-pbi.md")) 'repo mode puts spec/plan in the repo; PBI stays in the task folder; REFINED-PBI.md accepted'
     Check (((& git -C $fixture status --porcelain) -join "`n") -match 'specs/') 'repo-mode artifacts are visible in git status'
@@ -353,11 +359,12 @@ try {
     # repository specsDir (e.g. src\.github\specs\<Feature>\) and the repository's own guidance
     New-Item -ItemType Directory -Force "$tasks\colordms\305912" | Out-Null
     Set-Content "$tasks\colordms\305912\refined-pbi.md" '# Imitation request paint system for DAB'
-    $t = Task -Id 305912
-    Check ($t.status -eq 'NEEDS_FEATURE' -and $t.specsDir -eq "$cdms\src\.github\specs" -and -not (Test-Path "$cdms\src\.github\specs")) 'specsDir: first run asks for a feature folder name and creates nothing'
     $t = Task -Id 305912 -Feature ImitationRequestPaintSystem
+    Check ($t.status -eq 'BRANCH_DECISION_NEEDED' -and $t.specsDir -eq "$cdms\src\.github\specs" -and -not (Test-Path "$cdms\src\.github\specs")) 'specsDir: nothing is created in the repository before the branch decision'
+    $null = PS51 $helper branchuse -Repo colordms -Id 305912 -Confirmed
+    $t = Task -Id 305912
     $specDir = "$cdms\src\.github\specs\ImitationRequestPaintSystem"
-    Check ($t.status -eq 'READY' -and $t.mode -eq 'repo' -and (Test-Path "$specDir\spec.md") -and (Test-Path "$specDir\plan.md")) 'specsDir: spec and plan created in <repo>\src\.github\specs\<Feature>\'
+    Check ($t.status -eq 'READY' -and $t.mode -eq 'repo' -and (Test-Path "$specDir\spec.md") -and (Test-Path "$specDir\plan.md")) 'specsDir: after the branch decision, spec and plan are created in the chosen <repo>\src\.github\specs\<Feature>\'
     $t = Task -Id 305912
     Check ($t.status -eq 'READY' -and (Split-Path $t.spec) -eq $specDir -and @($t.created).Count -eq 0) 'specsDir: resume finds the same spec folder without -Feature'
     $g = @($t.repoGuidance | ForEach-Object { $_.path })
@@ -374,14 +381,18 @@ try {
     $box = (PS51 $helper inbox).out | ConvertFrom-Json
     $folderItem = @($box.items | Where-Object { $_.name -eq '405100-notes' })[0]
     Check (@($box.items).Count -eq 2 -and $folderItem.kind -eq 'folder' -and $folderItem.suggestedId -eq '405100' -and $folderItem.suggestedTitle -eq 'Adaptation imitation request - paint system' -and @($box.registeredRepos) -contains 'colordms') 'inbox: lists dropped file and folder with detected PBI, suggested number and title, and repos'
-    $t = (PS51 $helper intake -Source "$inbox\405100-notes" -Id 405100 -Title 'Adaptation imitation request - paint system' -Repo colordms).out | ConvertFrom-Json
+    $t0 = (PS51 $helper intake -Source "$inbox\405100-notes" -Id 405100 -Title 'Adaptation imitation request - paint system' -Repo colordms).out | ConvertFrom-Json
     $iDir = "$tasks\colordms\405100"
-    $iSpec = "$cdms\src\.github\specs\AdaptationImitationRequestPaintSystem"
+    $iSpec = "$cdms\src\.github\specs\405100-adaptation-imitation-request-paint-system"   # <id>-<title>: unique per work item
+    Check ($t0.status -eq 'BRANCH_DECISION_NEEDED' -and $t0.specFolder -eq $iSpec -and -not (Test-Path $iSpec) -and (Test-Path "$iDir\refined-pbi.md")) 'intake: the PBI is taken in, then the branch decision comes before any file in the repository'
+    $null = PS51 $helper branchuse -Repo colordms -Id 405100 -Confirmed
+    $t = Task -Id 405100
     Check ($t.status -eq 'READY' -and (Test-Path "$iDir\refined-pbi.md") -and (Test-Path "$iDir\DECISION-LOG.md") -and (Test-Path "$iDir\handover\cdms.md") -and (Test-Path "$iSpec\spec.md") -and (Test-Path "$iSpec\plan.md")) 'intake: PBI and notes copied into the task; spec and plan in specsDir\<FeatureFromTitle>'
     Check ($t.title -eq 'Adaptation imitation request - paint system' -and (Test-Path "$inbox\405100-notes\REFINED-PBI.md") -and @($t.inputs).Count -eq 2) 'intake: title recorded, inbox copy left in place, notes listed as inputs'
     Set-Content "$inbox\other.md" 'different text'
-    $r = PS51 $helper intake -Source "$inbox\other.md" -Id 405100 -Title 'x' -Repo colordms
-    Check ($r.code -ne 0 -and $r.out -match 'already has a different refined-pbi.md' -and (Get-Content "$iDir\refined-pbi.md" -Raw) -match 'Adaptation') 'intake: never replaces an existing different refined PBI'
+    $rx = (PS51 $helper intake -Source "$inbox\other.md" -Id 405100 -Title 'x' -Repo colordms).out | ConvertFrom-Json
+    $r = PS51 $helper intake -Source "$inbox\other.md" -Id 405100 -Title 'x' -Repo colordms -Resume
+    Check ($rx.status -eq 'TASK_EXISTS' -and $rx.suggestedNewId -eq '405100-2' -and $r.code -ne 0 -and $r.out -match 'already has a different refined-pbi.md' -and (Get-Content "$iDir\refined-pbi.md" -Raw) -match 'Adaptation') 'intake: never replaces an existing different refined PBI (new development reports TASK_EXISTS; resume refuses a different PBI)'
     $t = (PS51 $helper intake -Source "$inbox\pbi-405200.md" -Id 405200 -Title 'Loose file PBI' -Repo backend).out | ConvertFrom-Json
     Check ($t.status -eq 'READY' -and (Test-Path "$tasks\backend\405200\refined-pbi.md") -and (Test-Path "$tasks\backend\405200\spec.md")) 'intake: single file into a repo without specsDir (spec beside the PBI)'
     Remove-Item "$cdms\src\.github\specs" -Recurse -Force
@@ -552,6 +563,7 @@ try {
     Check ($rule.IsMatch($call.Replace('task -Id 305912 -Feature X', 'sonar -Repo r -Check issues -File "src/A.cs;src/B.cs" -NewCode')) -and $rule.IsMatch($call.Replace('task -Id 305912 -Feature X', 'coverage -Repo r -Report "C:\t\evidence\coverage.cobertura.xml"'))) 'vscode: auto-approve covers the read-only sonar and coverage commands'
     Check ($rule.IsMatch($call.Replace('task -Id 305912 -Feature X', 'context -Repo r -Query "validate order amount" -Mode deep')) -and $rule.IsMatch($call.Replace('task -Id 305912 -Feature X', 'remember -Repo r -Type validation -Text "Rules live in validators" -Evidence "src/A.cs:3;src/B.cs:9"')) -and $rule.IsMatch($call.Replace('task -Id 305912 -Feature X', 'forget -Repo r -Id F-1a2b3c4d -Text "moved"')) -and -not $rule.IsMatch($call.Replace('task -Id 305912 -Feature X', 'remember -Repo r -Text "x" ; Remove-Item C:\x'))) 'vscode: auto-approve covers context, remember, and forget, still without chaining'
     Check ($rule.IsMatch($call.Replace('task -Id 305912 -Feature X', 'security -Id 305912')) -and $rule.IsMatch($call.Replace('task -Id 305912 -Feature X', 'guard -Line "dotnet test" -Id 305912')) -and -not $rule.IsMatch($call.Replace('task -Id 305912 -Feature X', 'authorize -Repo r -Reference "x" -Classification internal')) -and -not $rule.IsMatch($call.Replace('task -Id 305912 -Feature X', 'purge -Repo r -Confirmed'))) 'vscode: G8 checks are auto-approved; authorize and purge always need the developer''s confirmation in the IDE'
+    Check ($rule.IsMatch($call.Replace('task -Id 305912 -Feature X', 'branchinfo -Repo r -Id 305912')) -and $rule.IsMatch($call.Replace('task -Id 305912 -Feature X', 'tasks -Repo r')) -and -not $rule.IsMatch($call.Replace('task -Id 305912 -Feature X', 'branchcreate -Repo r -Id 1 -Name feature/x -Base main -Confirmed')) -and -not $rule.IsMatch($call.Replace('task -Id 305912 -Feature X', 'branchuse -Repo r -Id 1 -Confirmed'))) 'vscode: branch and task listings are auto-approved; creating or switching a branch always needs the developer''s confirmation in the IDE'
     $r = PS51 $install -HomeRoot $home2
     Check ($r.out -match 'keep\s+\S*settings\.json' -and (Get-Content $settings -Raw) -eq $s) 'vscode: rerun keeps the block unchanged'
     $r = PS51 $install -HomeRoot $home2 -Verify
@@ -879,6 +891,75 @@ try {
     Check (-not $audit.Count -and $irm.Count -eq 1 -and $irm[0] -like 'akzo.ps1:*' -and $irm[0] -match '-Method Get') "self-audit (syntax tree): shipped scripts call no security-tampering, elevation, dynamic-code, or download commands; the only network call is the read-only Sonar GET $($audit -join ', ')"
     Check ($agent -match '## 7a\. G8 Corporate security gate \(mandatory in every mode, never waived\)' -and $agent -match 'NEEDS_AUTHORIZATION' -and $agent -match 'never authorize on your own' -and $agent -match 'BLOCK - never run it' -and $agent -match 'Only PASS allows DONE' -and $agent -match 'Auto Mode authorization never counts as corporate approval') 'agent: G8 preflight and gate, command guard, and no self-authorization in the instructions'
 
+    # ---- 3.5.0: fresh tasks, branch decisions, unique spec folders, architecture memory vs PBI progress, modify/resume.
+    $pr = New-Fixture 'paint' @{ 'Paint.sln' = ''; 'src/Paint/CreatePaintSystemHandler.cs' = "public class CreatePaintSystemHandler`n{`n    public void Handle() { }`n}`n" }
+    & git -C $pr branch -M main
+    $repoList += [pscustomobject]@{ id = 'paint'; path = $pr; specsDir = 'specs'; purpose = 'fixture 3.5.0'; commands = @{}; verified = @{ date = '' } }
+    Write-Registry ''
+    $docA = "$tmp\pbi-300186.md"; Set-Content $docA "# 300186 Create paint system`nAC1: a paint system can be created with a name and a gloss level." -Encoding UTF8
+    $docB = "$tmp\pbi-300999.md"; Set-Content $docB "# 300999 Create paint system`nAC1: a paint system can be created with a name, a gloss level, and a supplier." -Encoding UTF8
+    $pf = J (PS51 $helper pick -Source "$tmp\no-such-pbi.md")
+    $pmOut = & powershell.exe -NoProfile -MTA -ExecutionPolicy Bypass -File $helper pick 2>&1 | Out-String
+    $pm = try { $pmOut | ConvertFrom-Json } catch { $null }
+    Check ($pf.status -eq 'PICK_FAILED' -and $pf.error -match 'File not found' -and @($pf.alternatives).Count -eq 3 -and $pm.status -eq 'PICK_FAILED' -and $pm.error -match 'STA') 'pick: a missing file or a dialog that cannot open is reported with the file-path and launcher alternatives (intake is never skipped)'
+    $a1 = J (PS51 $helper intake -Source $docA -Id 300186 -Title 'Create paint system' -Repo paint)
+    Check ($a1.status -eq 'BRANCH_DECISION_NEEDED' -and $a1.branch.branch -eq 'main' -and $a1.branch.integrationBranch -and $a1.branch.recommend -eq 'new' -and $a1.branch.proposedBranch -eq 'feature/300186-create-paint-system' -and $a1.branch.defaultBase -eq 'main' -and @($a1.branch.options).Count -eq 3 -and -not (Test-Path "$pr\specs")) 'new development on a shared branch: feature/<id>-<title> is proposed with a base to confirm, three choices are offered, and nothing is created yet'
+    $bad1 = PS51 $helper branchcreate -Repo paint -Id 300186 -Name feature/300186-create-paint-system -Base main
+    Add-Content "$pr\src\Paint\CreatePaintSystemHandler.cs" '// work in progress'
+    $bad2 = PS51 $helper branchcreate -Repo paint -Id 300186 -Name feature/300186-create-paint-system -Base main -Confirmed
+    Check ($bad1.code -ne 0 -and $bad1.out -match '-Confirmed' -and $bad2.code -ne 0 -and $bad2.out -match 'uncommitted' -and (& git -C $pr branch --show-current) -eq 'main' -and -not (& git -C $pr stash list)) 'branch: nothing is switched without the developer''s choice, nor with uncommitted changes unless they agree; nothing is stashed'
+    $bad3 = PS51 $helper branchcreate -Repo paint -Id 300186 -Name 'Feature/Paint System' -Base main -Confirmed -AllowDirty
+    $bad4 = PS51 $helper branchcreate -Repo paint -Id 300186 -Name feature/x -Base no-such-base -Confirmed -AllowDirty
+    Check ($bad3.code -ne 0 -and $bad3.out -match 'lowercase, Git-safe' -and $bad4.code -ne 0 -and $bad4.out -match 'was not found') 'branch: names must be lowercase and Git-safe, and the confirmed base must exist'
+    $ok = J (PS51 $helper branchcreate -Repo paint -Id 300186 -Name feature/300186-create-paint-system -Base main -Confirmed -AllowDirty)
+    Check ($ok.status -eq 'BRANCH_READY' -and $ok.decision -eq 'created' -and (& git -C $pr branch --show-current) -eq 'feature/300186-create-paint-system' -and (Get-Content "$pr\src\Paint\CreatePaintSystemHandler.cs" -Raw) -match 'work in progress' -and -not (& git -C $pr stash list)) 'branch: the confirmed feature branch is created from the confirmed base; uncommitted work comes along, nothing is stashed or lost'
+    $a2 = Task -Id 300186
+    Check ($a2.status -eq 'READY' -and $a2.taskKind -eq 'new' -and (Test-Path "$pr\specs\300186-create-paint-system\spec.md") -and (Test-Path "$pr\specs\300186-create-paint-system\plan.md") -and $a2.branchState.recordedForThisPbi -eq 'feature/300186-create-paint-system' -and $a2.branchState.relation -eq 'matches the recorded branch') 'after the branch decision a fresh spec and plan are created in <specsDir>\<id>-<title>, and the branch is recorded for the PBI'
+    $e1 = J (PS51 $helper branchinfo -Repo paint -Id 300186)
+    Check ($e1.proposedExists -and $e1.alternativeBranch -eq 'feature/300186-create-paint-system-2' -and $e1.recommend -eq 'current') 'branch: an existing proposed branch is detected and an alternative is offered; the PBI''s own branch is recommended for it'
+    # Complete 300186: approved and done, committed on its branch.
+    (Get-Content $a2.spec) -replace '^Status: .*', 'Status: Approved (by dev, 2026-10-26)' -replace '^Gap map: .*', 'Gap map: Approved (by dev, 2026-10-26)' | Set-Content $a2.spec
+    (Get-Content $a2.plan) -replace '^Status: .*', 'Status: Done' | Set-Content $a2.plan
+    & git -C $pr add -A; & git -C $pr commit -qm 'paint system'
+    $fa = J (PS51 $helper remember -Repo paint -Type component -Text 'CreatePaintSystemHandler handles paint system creation in src/Paint' -Evidence 'src/Paint/CreatePaintSystemHandler.cs:1')
+    $fb = PS51 $helper remember -Repo paint -Type decision -Text 'PBI 300186 was approved and is done' -Evidence 'Paint.sln'
+    $fc = PS51 $helper remember -Repo paint -Type decision -Text 'Task 300186 scope covers creation only' -Evidence 'Paint.sln'
+    Check ($fa.status -eq 'STORED' -and $fb.code -ne 0 -and $fb.out -match 'architecture knowledge' -and $fc.code -ne 0 -and $fc.out -match '300186') 'memory: architecture facts are stored; facts about a PBI''s approval, scope, or progress are refused (they belong to the task)'
+    # Fresh development after the completed PBI, same title.
+    $b1 = J (PS51 $helper intake -Source $docB -Id 300999 -Title 'Create paint system' -Repo paint)
+    Check ($b1.status -eq 'BRANCH_DECISION_NEEDED' -and $b1.branch.recommend -eq 'new' -and $b1.branch.reason -match 'another PBI \(300186\)' -and $b1.specFolder -like '*\specs\300999-create-paint-system') 'fresh development after a completed PBI: a separate task and spec folder, and a new branch is recommended because the current one belongs to the other PBI'
+    $b2 = J (PS51 $helper branchcreate -Repo paint -Id 300999 -Name feature/300999-create-paint-system -Base feature/300186-create-paint-system -Confirmed)
+    $b3 = Task -Id 300999
+    Check ($b2.status -eq 'BRANCH_READY' -and $b3.status -eq 'READY' -and $b3.taskKind -eq 'new' -and $b3.gapMapStatus -eq 'not started' -and $b3.specStatus -eq 'not started' -and $b3.planStatus -eq 'not started' -and -not $b3.completed -and (Split-Path $b3.spec) -ne (Split-Path $a2.spec) -and (Get-Content $a2.spec -Raw) -match 'Status: Approved') 'fresh task: none of the earlier PBI''s approvals or completion is carried over, and its spec is untouched'
+    Check ((@($b3.memory.verifiedFacts) -join ' ') -match [regex]::Escape($fa.id) -and @($b3.overlap | Where-Object { $_.id -eq '300186' -and $_.completed }).Count -eq 1) 'fresh task: verified architecture memory is reused, and the completed overlapping PBI is reported so it is checked, not reimplemented'
+    $c1 = J (PS51 $helper branchuse -Repo paint -Id 300999 -Name main -Confirmed -AllowDirty)
+    $c2 = Task -Id 300999
+    Check ($c1.decision -eq 'selected' -and (& git -C $pr branch --show-current) -eq 'main' -and (Test-Path "$pr\specs\300999-create-paint-system\spec.md") -and @($c2.memory.staleFacts | Where-Object { $_ -like "$($fa.id)*" }).Count -eq 1) 'existing branch selected: untracked spec files come along, and memory whose evidence differs on that branch is reported stale, not reused unchecked'
+    # Unique spec locations, wrong branch, modify and resume.
+    New-Item -ItemType Directory -Force "$tasks\paint\301000" | Out-Null
+    Set-Content "$tasks\paint\301000\refined-pbi.md" "# 301000 Paint export`nAC1: paint systems can be exported." -Encoding UTF8
+    $tk = Task -Id 301000 -Feature 300186-create-paint-system
+    Check ($tk.status -eq 'SPEC_LOCATION_TAKEN' -and $tk.owner -eq '300186' -and $tk.suggestedFeature -eq '301000-paint-export') 'spec location: another PBI''s spec folder is never reused or written; a unique name is suggested'
+    $wb = Task -Id 300186
+    Check ($wb.status -eq 'WRONG_BRANCH' -and $wb.recordedBranch -eq 'feature/300186-create-paint-system' -and $wb.currentBranch -eq 'main' -and -not (Test-Path "$pr\specs\300186-create-paint-system")) 'resume on another branch: reported as WRONG_BRANCH; the spec is never recreated from templates'
+    $null = PS51 $helper branchuse -Repo paint -Id 300186 -Name feature/300186-create-paint-system -Confirmed -AllowDirty
+    $m1 = J (PS51 $helper intake -Source $docA -Id 300186 -Title 'Create paint system' -Repo paint)
+    Check ($m1.status -eq 'TASK_EXISTS' -and $m1.existing.completed -and $m1.suggestedNewId -eq '300186-2' -and @($m1.choices).Count -eq 3) 'new development with an existing id: reported with resume, modify, and separate-task choices, never silently resumed'
+    $sn = J (PS51 $helper snapshot -Id 300186 -Text 'add supplier field')
+    $m2 = J (PS51 $helper intake -Source $docA -Id 300186 -Title 'Create paint system' -Repo paint -Resume)
+    Check ($sn.status -eq 'SNAPSHOT_SAVED' -and (Test-Path (Join-Path $sn.folder 'spec.md')) -and (Get-Content (Join-Path $sn.folder 'snapshot.json') -Raw) -match 'Approved' -and $m2.status -eq 'READY' -and $m2.taskKind -eq 'existing' -and $m2.specStatus -like 'Approved*' -and $m2.completed) 'modify / resume: spec, plan, and statuses are snapshotted first; resume loads that same task with its own statuses'
+    $tl = J (PS51 $helper tasks -Repo paint)
+    Check (@($tl.completed) -contains '300186' -and @($tl.inProgress) -contains '300999' -and @($tl.inProgress) -contains '301000') 'tasks: each PBI of the repository is listed with its own status'
+    # A task created before 3.5.0 (spec already in the repository, no branch decision recorded) resumes as before.
+    New-Item -ItemType Directory -Force "$tasks\paint\290000", "$pr\specs\OldFeature" | Out-Null
+    Set-Content "$tasks\paint\290000\refined-pbi.md" "# 290000 Old feature`nAC1: old." -Encoding UTF8
+    [pscustomobject]@{ repo = 'paint'; id = '290000'; title = 'Old feature'; specDir = "$pr\specs\OldFeature"; agentVersion = '3.4.1' } | ConvertTo-Json | Set-Content "$tasks\paint\290000\task.json"
+    (Get-Content "$Source\copilot\modules\spec\assets\spec.md") -replace '^Status: .*', 'Status: Approved (by dev, 2026-10-01)' | Set-Content "$pr\specs\OldFeature\spec.md"
+    Copy-Item "$Source\copilot\modules\plan\assets\plan.md" "$pr\specs\OldFeature\plan.md"
+    $old = Task -Id 290000
+    Check ($old.status -eq 'READY' -and $old.taskKind -eq 'existing' -and $old.specStatus -like 'Approved*' -and $old.branchState.relation -match 'no branch decision recorded') 'upgrade: a task created before 3.5.0 resumes with its spec and approvals; the missing branch decision is reported, not forced'
+    Check ($agent -match '"New Development"' -and $agent -match '"Start Implementation"' -and $agent -match 'Never resume or reuse the previous PBI' -and $agent -match 'never take the newest inbox item' -and $agent -match 'a\) start new development and browse for a PBI' -and $agent -match 'b\) modify an existing implementation' -and $agent -match 'c\) resume an existing PBI' -and $agent -match 'Never skip intake') 'agent: fresh-task entry phrases, the a/b/c choice for ambiguous requests, and no skipped intake'
+    Check ($agent -match '## 0a\. Repository and branch' -and $agent -match 'a\) create a new feature branch' -and $agent -match 'b\) continue on the current branch' -and $agent -match 'c\) select an existing branch' -and $agent -match 'never assumptions' -and $agent -match 'Never stash, reset' -and $agent -match 'nothing moves from reading the PBI straight to implementation' -and $agent -match '\*\*Modify\*\*' -and $agent -match 'Architecture memory vs PBI progress' -and $agent -match 'A stage with build errors is never marked done') 'agent: branch step, the fixed 11-step order, Modify mode, memory separation, and stage validation'
     # ---- Sonar: setup detection (no network), read-only server queries against a local stand-in, changed-line coverage.
     $savedSonar = @($env:SONAR_TOKEN, $env:SONAR_HOST_URL); $env:SONAR_TOKEN = $null; $env:SONAR_HOST_URL = $null
     try {
@@ -1005,5 +1086,7 @@ while ($l.IsListening) {
 }
 Check ((Snapshot $real) -eq $realBefore) 'real user-level Copilot/Visual Studio/Akzo folders untouched'
 
+if ($script:slow.Count) { Write-Output "`nSlowest steps (15 s or more since the previous check):"; $script:slow | Sort-Object -Descending | Select-Object -First 10 | ForEach-Object { Write-Output "  $_" } }
+Write-Output "Total $([int]$script:clock.Elapsed.TotalSeconds) s."
 Write-Output "`n$($script:pass) passed, $($script:fail) failed."
 exit $(if ($script:fail) { 1 } else { 0 })

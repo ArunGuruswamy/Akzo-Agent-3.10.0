@@ -91,6 +91,20 @@ try {
         $w.Dispose()
     } finally { $zip.Dispose() }
 
+    # 0. The agent's own pick (as Copilot runs it): the dialog opens; Cancel reports CANCELLED and creates nothing.
+    $inboxDir = Join-Path $home2 '.akzo-agent\inbox'
+    $inboxBefore = @(Get-ChildItem $inboxDir -ErrorAction SilentlyContinue).Count
+    $pickOut = Join-Path $env:TEMP "akzo-gui-pick-$PID.json"
+    $env:AKZO_AGENT_HOME = Join-Path $home2 '.akzo-agent'
+    $pp = Start-Process powershell.exe -ArgumentList '-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File', "`"$(Join-Path $home2 '.akzo-agent\modules\investigate\scripts\akzo.ps1')`"", 'pick' -RedirectStandardOutput $pickOut -PassThru -WindowStyle Minimized
+    $started += $pp
+    $cdlg = Find-Window 'Akzo Master SDD - select*'
+    Check ([bool]$cdlg) 'pick (as the agent runs it) opens the PBI file dialog'
+    if ($cdlg) { Close-MessageBox $cdlg 2 }   # Cancel
+    [void]$pp.WaitForExit(30000)
+    $pres = try { Get-Content $pickOut -Raw | ConvertFrom-Json } catch { $null }
+    Check ($pres.status -eq 'CANCELLED' -and $pres.next -match 'nothing was created' -and @(Get-ChildItem $inboxDir -ErrorAction SilentlyContinue).Count -eq $inboxBefore) 'cancelling the dialog reports CANCELLED and creates nothing'
+    Remove-Item Env:AKZO_AGENT_HOME -ErrorAction SilentlyContinue; Remove-Item $pickOut -ErrorAction SilentlyContinue
     # 1. Start Development: real file dialog.
     $started += Start-Process cmd.exe -ArgumentList "/c `"`"$(Join-Path $Source 'Start-Development.cmd')`" -HomeRoot `"$home2`"`"" -PassThru -WindowStyle Minimized
     $dlg = Find-Window 'Akzo Master SDD - select*'
