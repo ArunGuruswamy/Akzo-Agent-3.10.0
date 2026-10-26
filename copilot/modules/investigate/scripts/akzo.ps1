@@ -1,0 +1,1952 @@
+﻿<#
+.SYNOPSIS
+  Helper for the Akzo SDD Copilot agent. Keeps agent state outside target repositories.
+  Windows PowerShell 5.1 and PowerShell 7 compatible. Writes only under $env:AKZO_AGENT_HOME
+  (default %USERPROFILE%\.akzo-agent) and the tasks folder (repos.json 'tasksDir', default <home>\tasks),
+  except spec.md/plan.md in repo mode (repo 'specsDir' in repos.json, or -RepoMode), which go into the repo.
+  Task layout: <tasks>\<repo-id>\<PBI-ID>\refined-pbi.md (user input, never modified), source\ (original of the
+  converted PBI), supporting\ (managed copies of supporting documents; originals are never changed), other input
+  files (read-only), inputs.json (input manifest: hash, type, role, status, extraction), .extract\ (cached text of
+  .docx/.pdf/.xlsx, keyed by content hash), spec.md + plan.md (external mode), refined-pbi.baseline.md (copy the
+  spec was last reconciled with), task.json (remembered spec location), evidence\.
+  Project knowledge per repository: maps\<repo-id>.md (verified facts the agent writes) and maps\<repo-id>\
+  architecture.json + component-index.tsv (derived from 'git ls-files', refreshed only when HEAD changes).
+.EXAMPLE
+  akzo.ps1 pick                                       # file dialogs: the refined PBI, then optional supporting documents
+  akzo.ps1 pick -Source "C:\docs\PBI 305912.docx"     # same without the dialog
+  akzo.ps1 pick -Source "C:\docs\PBI.docx" -Supporting "C:\docs\rules.xlsx;C:\docs\api.yaml"
+  akzo.ps1 attach -Id 305912 -Source "C:\docs\late-notes.docx"   # add supporting files to an existing task
+  akzo.ps1 role -Id 305912 -File "supporting\rules.xlsx" -Role business-rule   # correct a guessed role
+  akzo.ps1 discover -Repo backend-functions          # rebuild the repository's architecture index now
+  akzo.ps1 task -Id PBI-123                           # everything the agent needs to start or resume (one call)
+  akzo.ps1 task -Path "C:\...\PBI-123\refined-pbi.md" # same, from the file
+  akzo.ps1 task -Id PBI-123 -Repo backend-functions   # pick the repo / create the task folder
+  akzo.ps1 task -Id PBI-123 -Feature ImitationRequestPaintSystem   # spec folder name in the repo's specsDir
+  akzo.ps1 task -Id PBI-123 -Baseline                 # record refined-pbi.md as reconciled with spec/plan
+  akzo.ps1 task -Id PBI-123 -RepoMode                 # spec/plan in <repo>\specs\PBI-123\ when no specsDir is set
+  akzo.ps1 registry                                   # registered repos with path/git checks
+  akzo.ps1 state -Repo backend-functions              # branch, HEAD, pre-existing changes
+  akzo.ps1 graph -Repo backend-functions -Update      # optional Graphify code graph, stored outside the repo
+  akzo.ps1 graph -Repo backend-functions -Query "where is measurement validated"
+  akzo.ps1 sonar -Repo backend-functions              # Sonar setup of the repo and this machine (no network)
+  akzo.ps1 sonar -Repo backend-functions -Check gate -Branch feature/x   # read-only server query, token from SONAR_TOKEN
+  akzo.ps1 sonar -Repo backend-functions -Check issues -File "src/A.cs;src/B.cs" -NewCode
+  akzo.ps1 sonar -Repo backend-functions -Check rule -Key csharpsquid:S3776
+  akzo.ps1 coverage -Repo backend-functions -Report "C:\...\evidence\coverage.cobertura.xml"   # coverage of changed lines
+  akzo.ps1 context -Repo backend-functions -Query "validate gloss measurement range" -Mode balanced   # ranked files, symbols, facts
+  akzo.ps1 remember -Repo backend-functions -Type validation -Text "Input rules live in FluentValidation validators next to the command" -Evidence "src/Orders/CreateOrderValidator.cs:7" -Pbi 305912
+  akzo.ps1 forget -Repo backend-functions -Id F-1a2b3c4d -Text "validators moved to a pipeline behaviour"
+.NOTES
+  Akzo SDD Agent — Developed and maintained by Arun RG
+#>
+param(
+    [Parameter(Position = 0, Mandatory = $true)]
+    [ValidateSet('home', 'registry', 'state', 'inbox', 'pick', 'intake', 'attach', 'role', 'discover', 'task', 'graph', 'sonar', 'coverage', 'remember', 'forget', 'context', 'policy', 'authorize', 'guard', 'scan', 'security', 'purge')]
+    [string]$Command,
+    [string]$Reference,       # authorize: the approval you hold (ticket, policy, or approver)
+    [string]$Classification,  # authorize: public | internal | confidential (restricted needs an administrator policy)
+    [string]$Model,           # authorize: the model in use, checked against the policy's approvedModels
+    [string]$Hosts,           # authorize: hosts the helper may call for this repository (e.g. the Sonar server), ';'-separated
+    [string]$Line,            # guard: the command line to check
+    # guard only: Windows PowerShell 5.1 does not escape inner double quotes when it starts another program, so a quoted
+    # command arrives in pieces. The pieces are rejoined (quotes are lost, the words are not) and checked as one command.
+    [Parameter(ValueFromRemainingArguments = $true)]
+    [string[]]$Rest,
+    [string]$ApprovedBy,      # guard: who approved a NEEDS_APPROVAL command
+    [switch]$Confirmed,       # purge: required, the deletion cannot be undone
+    [switch]$IncludeTasks,    # purge: also delete the repository's task folders
+    [string]$Type,         # remember: fact type
+    [string]$Text,         # remember: the fact; forget: the reason
+    [string]$Evidence,     # remember: "path:line;path:line" (repo-relative)
+    [string]$DependsOn,    # remember: fact ids joined with ';'
+    [string]$Pbi,          # remember: the work item the fact was verified in
+    [ValidateSet('', 'compact', 'balanced', 'deep')]
+    [string]$Mode = '',    # context: retrieval budget
+    [ValidateSet('', 'gate', 'issues', 'hotspots', 'coverage', 'duplication', 'rule')]
+    [string]$Check = '',   # sonar: which read-only server query
+    [string]$Branch,
+    [string]$PullRequest,
+    [string]$Key,          # sonar -Check rule: the rule key, e.g. csharpsquid:S3776
+    [string]$Report,       # coverage: Cobertura or LCOV reports joined with ';'
+    [switch]$NewCode,
+    [string]$Supporting,   # several paths joined with ';'
+    [string]$File,
+    [string]$Role,
+    [string]$Repo,
+    [string]$Id,
+    [string]$Path,
+    [string]$Feature,
+    [string]$Source,
+    [string]$Title,
+    [switch]$Baseline,
+    [switch]$RepoMode,
+    [switch]$Update,
+    [string]$Query
+)
+$ErrorActionPreference = 'Stop'
+if ($Rest -and $Command -ne 'guard') { throw "Unexpected argument(s) for '$Command': $($Rest -join ' ')" }   # stray arguments stay an error everywhere but guard
+
+$ModulesDir = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)   # ...\modules
+$AkzoHome = if ($env:AKZO_AGENT_HOME) { $env:AKZO_AGENT_HOME } else { Join-Path $env:USERPROFILE '.akzo-agent' }
+$Registry = Join-Path $AkzoHome 'repos.json'
+$Config = $null
+if (Test-Path $Registry) {
+    try { $Config = Get-Content $Registry -Raw -Encoding UTF8 | ConvertFrom-Json } catch { throw "$Registry is not valid JSON: $($_.Exception.Message)" }
+}
+$TasksDir = if ($Config.tasksDir) { [Environment]::ExpandEnvironmentVariables($Config.tasksDir) } else { Join-Path $AkzoHome 'tasks' }
+if (-not [IO.Path]::IsPathRooted($TasksDir)) { throw "tasksDir '$TasksDir' in $Registry must be an absolute path." }
+$TasksDir = $TasksDir.TrimEnd('\', '/')
+$InboxDir = Join-Path $AkzoHome 'inbox'   # drop refined PBIs (file or folder) here; 'intake' copies them into a task
+$Utf8NoBom = New-Object Text.UTF8Encoding($false)
+$VersionFile = Join-Path $ModulesDir 'VERSION'
+$Version = if (Test-Path $VersionFile) { (Get-Content $VersionFile -TotalCount 1).Trim() } else { 'unknown' }
+
+# Windows PowerShell 5.1 turns `2>$null` on a native command into a terminating error under 'Stop'.
+function Invoke-Quiet {
+    $ErrorActionPreference = 'Continue'
+    $exe, $rest = $args
+    & $exe @rest 2>$null
+}
+
+function Test-Dir([string]$p) {   # registry is user-edited: tolerate empty or malformed paths
+    try { [bool]($p -and (Test-Path -LiteralPath $p)) } catch { $false }
+}
+
+function Get-Registry { @($Config.repos | Where-Object { $_ }) }
+
+function Get-FeatureName([string]$t) {   # "Imitation request - paint system" -> ImitationRequestPaintSystem
+    (@($t -split '[^A-Za-z0-9]+' | Where-Object { $_ }) | ForEach-Object { $_.Substring(0, 1).ToUpperInvariant() + $_.Substring(1) }) -join ''
+}
+
+function Find-PbiFile([string]$folder) {   # the refined PBI inside a dropped folder
+    $md = @(Get-ChildItem -LiteralPath $folder -File -Filter *.md)
+    $hit = @($md | Where-Object { $_.BaseName -match 'refined[-_ ]?pbi' })
+    if ($hit.Count -eq 1) { return $hit[0].FullName }
+    if ($md.Count -eq 1) { return $md[0].FullName }
+    $null
+}
+
+function Get-GitTop([string]$dir) {   # work tree containing $dir (or its nearest existing parent), else empty
+    while ($dir -and -not (Test-Path -LiteralPath $dir)) { $dir = Split-Path $dir }
+    if ($dir) { Invoke-Quiet git -C $dir rev-parse --show-toplevel }
+}
+
+function Out-Task([string]$status, [Collections.IDictionary]$info) {
+    $info.status = $status
+    [pscustomobject]$info | ConvertTo-Json -Depth 4 -Compress   # compact: this output goes into the model's context
+}
+
+function Resolve-Repo([string]$r) {
+    $reg = Get-Registry
+    $hit = $reg | Where-Object { $_.id -eq $r } | Select-Object -First 1
+    $path = if ($hit) { $hit.path } elseif ($r) { $r } else { (Get-Location).Path }
+    if (-not (Test-Dir $path)) { throw "Repository '$r' not found (path '$path'). Fix $Registry or open/clone the repository." }
+    $top = Invoke-Quiet git -C $path rev-parse --show-toplevel
+    if (-not $top) { throw "'$path' is not a git repository." }
+    $full = (Resolve-Path $top).Path
+    if (-not $hit) {
+        $hit = $reg | Where-Object { (Test-Dir $_.path) -and (Resolve-Path -LiteralPath $_.path).Path -eq $full } | Select-Object -First 1
+    }
+    [pscustomobject]@{ id = $(if ($hit) { $hit.id } else { Split-Path $full -Leaf }); path = $full; registered = [bool]$hit; cfg = $hit }
+}
+
+function Get-WorkspaceRepo {   # the registered repository that contains the current folder (the IDE workspace), else ''
+    $top = Get-GitTop (Get-Location).Path
+    if (-not $top) { return '' }
+    $full = (Resolve-Path -LiteralPath $top).Path
+    $hit = Get-Registry | Where-Object { (Test-Dir $_.path) -and (Resolve-Path -LiteralPath $_.path).Path -eq $full } | Select-Object -First 1
+    "$($hit.id)"
+}
+
+# The repository's own Copilot/agent customizations (skills, instructions, prompts, AGENTS.md), at the repo root
+# and one folder down (e.g. src\.github). Paths and descriptions only; the agent reads the relevant ones.
+function Get-RepoGuidance([string]$root) {
+    $skip = 'node_modules', 'bin', 'obj', 'dist', '.git', '.angular', '.vs'
+    $bases = @($root) + @(Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -notin $skip } | ForEach-Object { $_.FullName })
+    $patterns = 'AGENTS.md', '.github\copilot-instructions.md', '.github\instructions\*.instructions.md', '.github\prompts\*.prompt.md',
+        '.github\skills\*\SKILL.md', '.claude\skills\*\SKILL.md', '.agents\skills\*\SKILL.md', '.github\agents\*.agent.md'
+    foreach ($b in $bases) {
+        foreach ($p in $patterns) {
+            foreach ($f in Get-ChildItem -Path (Join-Path $b $p) -File -Force -ErrorAction SilentlyContinue) {
+                $head = (Get-Content -LiteralPath $f.FullName -TotalCount 15 -Encoding UTF8) -join "`n"
+                $desc = if ($head -match '(?m)^description:\s*(.+)$') { $Matches[1].Trim(' ''"') } else { '' }
+                $apply = if ($head -match '(?m)^applyTo:\s*(.+)$') { $Matches[1].Trim(' ''"') } else { '' }
+                [pscustomobject]@{ path = $f.FullName.Substring($root.Length).TrimStart('\'); description = $desc; applyTo = $apply }
+            }
+        }
+    }
+}
+
+function Get-InboxItem($i) {   # one inbox entry with the PBI number and title guessed from its name and first heading
+    $pbiFile = if ($i.PSIsContainer) { Find-PbiFile $i.FullName } elseif ($i.Extension -in '.md', '.txt') { $i.FullName } else { $null }
+    # "$(...)": a file without a heading yields '' instead of an empty array (which has no .Trim()).
+    $heading = if ($pbiFile) { "$(Get-Content -LiteralPath $pbiFile -TotalCount 20 -Encoding UTF8 | Where-Object { $_ -match '^\s*#+\s*\S' } | Select-Object -First 1)" -replace '^\s*#+\s*', '' } else { '' }
+    [pscustomobject]@{
+        name = $i.Name; path = $i.FullName; kind = $(if ($i.PSIsContainer) { 'folder' } else { 'file' }); pbiFile = $pbiFile
+        suggestedId = [regex]::Match("$($i.Name) $heading", '\d{4,}').Value; suggestedTitle = ($heading -replace '^\s*\d{4,}\s*[-:.]?\s*', '').Trim()
+        modified = $i.LastWriteTime.ToString('yyyy-MM-dd HH:mm')
+    }
+}
+
+# Requirement document -> markdown text. Word is read from its XML (no Office needed); PDF needs pdftotext on PATH.
+function ConvertTo-PbiText([string]$file) {
+    $ext = [IO.Path]::GetExtension($file).ToLowerInvariant()
+    if ($ext -in '.md', '.markdown', '.txt') { return [IO.File]::ReadAllText($file) }
+    if ($ext -eq '.docx') {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $zip = [IO.Compression.ZipFile]::OpenRead($file)
+        try {
+            $entry = $zip.GetEntry('word/document.xml')
+            if (-not $entry) { throw "'$file' is not a Word document (word/document.xml missing)." }
+            $reader = New-Object IO.StreamReader($entry.Open())
+            try { $xml = [xml]$reader.ReadToEnd() } finally { $reader.Dispose() }
+        } finally { $zip.Dispose() }
+        $ns = New-Object Xml.XmlNamespaceManager($xml.NameTable)
+        $ns.AddNamespace('w', 'http://schemas.openxmlformats.org/wordprocessingml/2006/main')
+        $lines = foreach ($p in $xml.SelectNodes('//w:body//w:p', $ns)) {
+            $text = (@($p.SelectNodes('.//w:t|.//w:tab', $ns) | ForEach-Object { if ($_.LocalName -eq 'tab') { "`t" } else { $_.InnerText } }) -join '')
+            $style = $p.SelectSingleNode('w:pPr/w:pStyle/@w:val', $ns)
+            if ($style -and $style.Value -match '^(Heading|Title)(\d?)$') { ('#' * [Math]::Max(1, [Math]::Min(6, [int]"0$($Matches[2])"))) + " $text" }
+            elseif ($p.SelectSingleNode('w:pPr/w:numPr', $ns)) { "- $text" }
+            else { $text }
+        }
+        return ($lines -join "`n")
+    }
+    if ($ext -eq '.xlsx') { return ConvertFrom-Xlsx $file }
+    if ($ext -eq '.pdf') {
+        $tool = Get-Command pdftotext -ErrorAction SilentlyContinue
+        if (-not $tool) { throw "A PDF needs 'pdftotext' (Poppler) on PATH. Save the PBI as .docx, .md, or .txt instead." }
+        $tmp = [IO.Path]::GetTempFileName()
+        try {
+            & $tool.Source -layout -enc UTF-8 $file $tmp
+            if ($LASTEXITCODE -ne 0) { throw "pdftotext failed ($LASTEXITCODE) on '$file'." }
+            return [IO.File]::ReadAllText($tmp)
+        } finally { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+    }
+    throw "Unsupported file type '$ext'. Use .md, .txt, .docx, .xlsx, or .pdf."
+}
+
+# Excel workbook -> one Markdown table per sheet, read from its XML (no Office needed). Values as stored
+# (numbers and dates unformatted); at most 2000 rows per sheet.
+function ConvertFrom-Xlsx([string]$file) {
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $zip = [IO.Compression.ZipFile]::OpenRead($file)
+    try {
+        $read = { param($name) $e = $zip.GetEntry($name); if (-not $e) { return $null }; $sr = New-Object IO.StreamReader($e.Open()); try { [xml]$sr.ReadToEnd() } finally { $sr.Dispose() } }
+        $wb = & $read 'xl/workbook.xml'
+        if (-not $wb) { throw "'$file' is not an Excel workbook (xl/workbook.xml missing)." }
+        $rels = & $read 'xl/_rels/workbook.xml.rels'
+        $ss = & $read 'xl/sharedStrings.xml'
+        $strings = @(if ($ss) { foreach ($si in @($ss.sst.si)) { (@($si.SelectNodes('.//*[local-name()="t"]')) | ForEach-Object { $_.InnerText }) -join '' } })
+        $out = New-Object Text.StringBuilder
+        foreach ($sheet in @($wb.workbook.sheets.sheet)) {
+            $rid = $sheet.GetAttribute('id', 'http://schemas.openxmlformats.org/officeDocument/2006/relationships')
+            $target = (@($rels.Relationships.Relationship) | Where-Object { $_.Id -eq $rid } | Select-Object -First 1).Target
+            if (-not $target) { continue }
+            $doc = & $read $(if ($target.StartsWith('/')) { $target.TrimStart('/') } else { "xl/$target" })
+            if (-not $doc) { continue }
+            [void]$out.AppendLine("## Sheet: $($sheet.name)").AppendLine()
+            $rows = @($doc.worksheet.sheetData.row | Where-Object { $_ })
+            $n = 0
+            foreach ($row in $rows) {
+                if (++$n -gt 2000) { [void]$out.AppendLine("(... $($rows.Count - 2000) more rows not extracted)"); break }
+                $cells = New-Object Collections.Generic.List[string]
+                foreach ($c in @($row.c | Where-Object { $_ })) {
+                    $col = 0
+                    foreach ($ch in ($c.r -replace '\d', '').ToCharArray()) { $col = $col * 26 + ([int]$ch - 64) }
+                    while ($cells.Count -lt $col - 1) { $cells.Add('') }   # keep empty cells in place
+                    $v = if ($c.t -eq 's') { $strings[[int]$c.v] } elseif ($c.t -eq 'inlineStr') { $c.is.InnerText } else { $c.v }
+                    $cells.Add((("$v" -replace '\|', '\|') -replace '\r?\n', ' '))
+                }
+                [void]$out.AppendLine('| ' + ($cells -join ' | ') + ' |')
+            }
+            [void]$out.AppendLine()
+        }
+        $out.ToString()
+    } finally { $zip.Dispose() }
+}
+
+# Copies a user's document into <root>\<sub>\ without ever touching the original. Same content already there ->
+# 'duplicate' (not copied); same name, other content -> '<name>-2.ext' ('renamed'). The origin is kept in .origins.tsv.
+function Copy-Managed([string]$src, [string]$root, [string]$sub = 'supporting') {
+    $leaf = Split-Path $src -Leaf
+    if (-not (Test-Path -LiteralPath $src -PathType Leaf)) { return [pscustomobject]@{ name = $leaf; from = $src; status = 'missing'; file = '' } }
+    $destDir = Join-Path $root $sub
+    New-Item -ItemType Directory -Force -Path $destDir | Out-Null
+    $item = Get-Item -LiteralPath $src
+    $hash = (Get-FileHash -LiteralPath $src).Hash
+    $same = Get-ChildItem -LiteralPath $destDir -File | Where-Object { $_.Length -eq $item.Length -and (Get-FileHash -LiteralPath $_.FullName).Hash -eq $hash } | Select-Object -First 1
+    if ($same) { return [pscustomobject]@{ name = $leaf; from = $src; status = 'duplicate'; file = "$sub\$($same.Name)" } }
+    $to = Join-Path $destDir $leaf; $status = 'added'
+    for ($n = 2; Test-Path -LiteralPath $to; $n++) { $to = Join-Path $destDir ("{0}-{1}{2}" -f $item.BaseName, $n, $item.Extension); $status = 'renamed' }
+    Copy-Item -LiteralPath $src $to
+    $rel = "$sub\$(Split-Path $to -Leaf)"
+    Add-Content -LiteralPath (Join-Path $root '.origins.tsv') -Value "$rel`t$($item.FullName)" -Encoding UTF8
+    [pscustomobject]@{ name = $leaf; from = $src; status = $status; file = $rel }
+}
+
+$ManagedFiles = 'refined-pbi.md', 'refined-pbi.baseline.md', 'spec.md', 'plan.md', 'task.json', 'inputs.json', '.origins.tsv'
+$InputRoles = 'business-rule', 'acceptance-criteria', 'functional-spec', 'technical-spec', 'api-contract', 'database-schema', 'architecture', 'test-case', 'sample-data', 'legacy-reference', 'general', 'primary-original'
+
+function Get-InputKind([string]$ext) {
+    switch -regex ($ext) {
+        '^\.(docx|pdf|xlsx)$' { 'convert'; break }
+        '^\.(png|jpe?g|gif|bmp|webp|tiff?)$' { 'image'; break }
+        '^\.(md|markdown|txt|json|ya?ml|xml|csv|tsv|html?|sql|graphql|gql|feature|cs|ts|tsx|js|jsx|java|py|go|kt|rb|php|ps1|sh|config|ini|toml|svg|puml|mmd|drawio|log)$' { 'text'; break }
+        default { 'unsupported' }
+    }
+}
+
+# A first guess from the file name and headings; the developer can correct it ('role' command).
+function Get-InputRole([string]$rel, [string]$heads) {
+    if ($rel -like 'source\*') { return 'primary-original' }
+    $t = "$rel $heads".ToLowerInvariant()
+    $ext = [IO.Path]::GetExtension($rel).ToLowerInvariant()
+    if ($t -match 'openapi|swagger|api[-_ ]?contract|\bendpoint' -or $ext -in '.graphql', '.gql') { return 'api-contract' }
+    if ($t -match 'schema|\bddl\b|database|\btables?\b|\berd\b' -or $ext -eq '.sql') { return 'database-schema' }
+    if ($t -match 'acceptance|criteria') { return 'acceptance-criteria' }
+    if ($t -match 'business[-_ ]?rule|validation|\brules?\b|policy') { return 'business-rule' }
+    if ($t -match 'test[-_ ]?case|scenario|\bqa\b|\buat\b' -or $ext -eq '.feature') { return 'test-case' }
+    if ($t -match 'sample|payload|example|mock' -or $ext -in '.csv', '.tsv') { return 'sample-data' }
+    if ($t -match 'architect|diagram|\bhld\b|component' -or (Get-InputKind $ext) -eq 'image' -or $ext -in '.puml', '.mmd', '.drawio') { return 'architecture' }
+    if ($t -match 'technical|design|\blld\b|\btsd\b') { return 'technical-spec' }
+    if ($t -match 'functional|\bfsd\b|\bfrs\b|requirement') { return 'functional-spec' }
+    if ($t -match 'legacy|existing|current[-_ ]?system|as[-_ ]?is' -or $ext -in '.cs', '.ts', '.js', '.java', '.py', '.go', '.kt', '.rb', '.php') { return 'legacy-reference' }
+    'general'
+}
+
+# Input manifest for one task folder. Hashes only files whose size or time changed; converts .docx/.pdf/.xlsx once
+# per content hash into .extract\ (written to a temp file first, so an interrupted run never leaves half a file).
+function Sync-InputManifest([string]$dir) {
+    $mf = Join-Path $dir 'inputs.json'
+    $cache = Join-Path $dir '.extract'
+    $issues = New-Object Collections.Generic.List[string]
+    $old = @{}
+    if (Test-Path -LiteralPath $mf) {
+        try { foreach ($e in @((Get-Content -LiteralPath $mf -Raw -Encoding UTF8 | ConvertFrom-Json).files)) { if ($e) { $old[$e.file] = $e } } }
+        catch { $issues.Add('inputs.json was unreadable and has been rebuilt') }
+    }
+    $origins = @{}
+    $of = Join-Path $dir '.origins.tsv'
+    if (Test-Path -LiteralPath $of) { foreach ($l in Get-Content -LiteralPath $of -Encoding UTF8) { $p = $l -split "`t", 2; if ($p.Count -eq 2) { $origins[$p[0]] = $p[1] } } }
+    $pbiFile = Join-Path $dir 'refined-pbi.md'
+    $pbiHash = if (Test-Path -LiteralPath $pbiFile) { (Get-FileHash -LiteralPath $pbiFile).Hash } else { '' }
+    $now = (Get-Date).ToString('s')
+    $entries = @(); $changed = @(); $seen = @{}; $dirty = $issues.Count -gt 0
+    $files = @(Get-ChildItem -LiteralPath $dir -Recurse -File | Where-Object {
+            -not ($_.DirectoryName -eq $dir -and $_.Name -in $ManagedFiles) -and $_.FullName.Substring($dir.Length + 1) -notmatch '^(evidence|\.extract)\\' })
+    foreach ($f in $files) {
+        $rel = $f.FullName.Substring($dir.Length + 1)
+        $prev = $old[$rel]
+        $stamp = "$($f.Length)|$($f.LastWriteTimeUtc.Ticks)"
+        $sha = if ($prev -and $prev.stamp -eq $stamp -and $prev.sha256) { $prev.sha256 } else { (Get-FileHash -LiteralPath $f.FullName).Hash }
+        $kind = Get-InputKind $f.Extension.ToLowerInvariant()
+        $original = $rel -like 'source\*'
+        $status = 'ok'; $note = ''; $read = $f.FullName
+        if ($original) { $read = '' }   # refined-pbi.md already holds its converted text
+        elseif ($kind -eq 'convert') {
+            $read = Join-Path $cache ($sha.Substring(0, 16) + '.md')
+            if (-not (Test-Path -LiteralPath $read)) {
+                try {
+                    $text = ConvertTo-PbiText $f.FullName
+                    New-Item -ItemType Directory -Force -Path $cache | Out-Null
+                    [IO.File]::WriteAllText("$read.tmp", $text, $Utf8NoBom)
+                    Move-Item -LiteralPath "$read.tmp" $read -Force
+                } catch { $status = 'unreadable'; $note = $_.Exception.Message; $read = '' }
+            }
+        } elseif ($kind -eq 'image') { $status = 'image'; $note = 'not read as text; attach it in chat if it matters' }
+        elseif ($kind -eq 'unsupported') { $status = 'unsupported'; $note = "no reader for '$($f.Extension)'"; $read = '' }
+        if (-not $original -and $status -in 'ok', 'image') {
+            if ($sha -eq $pbiHash) { $status = 'duplicate'; $note = 'same content as refined-pbi.md' }
+            elseif ($seen.ContainsKey($sha)) { $status = 'duplicate'; $note = "same content as $($seen[$sha])" }
+            else { $seen[$sha] = $rel }
+        }
+        $heads = if ($prev -and $prev.sha256 -eq $sha -and $null -ne $prev.headings) { "$($prev.headings)" }
+            elseif ($read -and (Test-Path -LiteralPath $read)) { (@(Get-Content -LiteralPath $read -TotalCount 400 -Encoding UTF8 | Where-Object { $_ -match '^#{1,3}\s+\S' } | Select-Object -First 8 | ForEach-Object { ($_ -replace '^#+\s*', '').Trim() }) -join '; ') }
+            else { '' }
+        $flag = if ($prev -and $prev.sha256 -eq $sha -and $null -ne $prev.flag) { "$($prev.flag)" }
+            elseif ($read -and $kind -ne 'image' -and (Test-Path -LiteralPath $read)) { Find-InstructionText ([IO.File]::ReadAllText($read)) }
+            else { '' }
+        if ($flag) { $issues.Add("instruction-like text in ${rel}: '$(Protect-Text $flag)' (treated as data, not followed)") }
+        if ($prev -and "$($prev.flag)" -ne $flag) { $dirty = $true }
+        if ($heads.Length -gt 200) { $heads = $heads.Substring(0, 200) }
+        $byUser = $prev -and $prev.roleSetBy -eq 'user'
+        if ($prev -and $prev.sha256 -ne $sha) { $changed += $rel }
+        if (-not $original -and $f.Name -match '^refined[-_ ]?pbi') { $issues.Add("second primary PBI: $rel (only refined-pbi.md is the requirement; rename it or set its role)") }
+        if ($status -in 'unsupported', 'unreadable', 'duplicate') { $issues.Add("${status}: $rel ($note)") }
+        if (-not $prev -or $prev.stamp -ne $stamp -or $prev.status -ne $status -or $prev.read -ne $read -or "$($prev.source)" -ne "$($origins[$rel])") { $dirty = $true }
+        $entries += [pscustomobject][ordered]@{
+            file = $rel; originalName = $f.Name; source = "$($origins[$rel])"; kind = $kind; kb = [math]::Round($f.Length / 1KB, 1)
+            sha256 = $sha; stamp = $stamp; role = $(if ($byUser) { $prev.role } else { Get-InputRole $rel $heads }); roleSetBy = $(if ($byUser) { 'user' } else { 'auto' })
+            status = $status; note = $note; read = $read; headings = $heads; flag = $flag; workItem = (Split-Path $dir -Leaf)
+            firstSeen = $(if ($prev) { $prev.firstSeen } else { $now }); lastChanged = $(if ($prev -and $prev.sha256 -eq $sha) { $prev.lastChanged } else { $now })
+        }
+    }
+    foreach ($k in $old.Keys) { if (-not ($entries | Where-Object { $_.file -eq $k })) { $issues.Add("missing: $k (registered earlier, file no longer present)"); $dirty = $true } }
+    # Serialize only when something changed (ConvertTo-Json is the slow part on Windows PowerShell 5.1).
+    if ($dirty -or -not (Test-Path -LiteralPath $mf)) {
+        [IO.File]::WriteAllText($mf, ([pscustomobject]@{ workItem = (Split-Path $dir -Leaf); files = @($entries) } | ConvertTo-Json -Depth 4), $Utf8NoBom)
+    }
+    [pscustomobject]@{ path = $mf; entries = @($entries); changed = @($changed); issues = @($issues) }
+}
+
+# Architecture index of a repository from 'git ls-files' (tracked + untracked, honours .gitignore; no folder walk),
+# rebuilt only when HEAD moved (or -Force). Generic naming roles, no project-specific names.
+$ComponentRoles = [ordered]@{
+    'test' = '((Tests?|Spec|IT)\.[A-Za-z]+$|\.(spec|test)\.[jt]sx?$|(^|/)tests?/)'
+    'ci' = '(azure-pipelines[^/]*\.ya?ml$|(^|/)\.github/workflows/|Jenkinsfile$|\.gitlab-ci\.yml$)'
+    'contract' = '(openapi|swagger)[^/]*\.(json|ya?ml)$'
+    'graphql' = '\.(graphql|gql)$'
+    'schema' = '(\.sql$|\.prisma$|(^|/)Migrations?/)'
+    'i18n' = '(^|/)i18n/.+\.json$'
+    'ui' = '(\.component\.(ts|html)$|\.(tsx|jsx|vue|svelte)$)'
+    'ui-service' = '\.service\.ts$'
+    'endpoint' = '(Controller|Controllers|Function|Functions|Endpoint|Endpoints|Resolver|Routes?)\.[A-Za-z]+$'
+    'command' = 'Command\.[A-Za-z]+$'
+    'query' = 'Query\.[A-Za-z]+$'
+    'handler' = 'Handler\.[A-Za-z]+$'
+    'validator' = '(Validator|Validation|Rules?)\.[A-Za-z]+$'
+    'service' = 'Service\.[A-Za-z]+$'
+    'repository' = '(Repository|Repo|Store|Dao|DbContext)\.[A-Za-z]+$'
+    'mapping' = '(Mapper|Mapping|Profile|Converter)\.[A-Za-z]+$'
+    'model' = '(Dto|Request|Response|Model|Entity|ViewModel)\.[A-Za-z]+$'
+    'di' = '(Program|Startup|DependencyInjection|ServiceCollectionExtensions|Module|Registration)\.[A-Za-z]+$'
+    'config' = '(appsettings[^/]*\.json|host\.json|application\.(ya?ml|properties))$'
+}
+
+# Memory format of maps\<repo-id>\ (architecture.json, symbols.tsv, facts.json). Older or unreadable files are rebuilt.
+$MemorySchema = 2
+$FactTypes = 'architecture', 'pattern', 'decision', 'component', 'validation', 'testing', 'integration', 'command', 'convention', 'pitfall'
+
+# Content fingerprint of every tracked and untracked file (honours .gitignore): repo-relative path -> git blob id.
+# Index blobs come from 'git ls-files -s'; files changed in the working tree or untracked are hashed by 'git hash-object'.
+function Get-FileBlobs([string]$root) {
+    $ErrorActionPreference = 'Continue'   # native stderr (line-ending warnings) must not end the helper
+    $map = New-Object 'Collections.Generic.Dictionary[string,string]'
+    foreach ($l in @(git -C $root -c core.quotepath=off ls-files -s 2>$null)) {
+        $tab = $l.IndexOf("`t"); if ($tab -gt 0) { $map[$l.Substring($tab + 1)] = $l.Split(' ')[1] }
+    }
+    # diff --name-only lists files changed or deleted in the work tree; ls-files -o lists untracked ones. A listed file that
+    # no longer exists was deleted (dropped from the map); the others are hashed from disk.
+    $listed = @(@(git -C $root -c core.quotepath=off diff --name-only 2>$null) + @(git -C $root -c core.quotepath=off ls-files -o --exclude-standard 2>$null) | Where-Object { $_ } | Sort-Object -Unique)
+    $dirty = New-Object Collections.Generic.List[string]
+    foreach ($f in $listed) { if (Test-Path -LiteralPath (Join-Path $root $f) -PathType Leaf) { $dirty.Add($f) } else { [void]$map.Remove($f) } }
+    # Paths as arguments in batches: piping to --stdin-paths from Windows PowerShell can prefix a byte-order mark.
+    for ($b = 0; $b -lt $dirty.Count; $b += 100) {
+        $batch = @($dirty[$b..([math]::Min($b + 99, $dirty.Count - 1))])
+        $ids = @(git -C $root hash-object -- @batch 2>$null)
+        if ($ids.Count -eq $batch.Count) { for ($i = 0; $i -lt $batch.Count; $i++) { $map[$batch[$i]] = $ids[$i] } }
+        else { foreach ($p in $batch) { $map[$p] = 'unhashed-' + (Get-Item -LiteralPath (Join-Path $root $p)).LastWriteTimeUtc.Ticks } }   # still changes the fingerprint
+    }
+    $map
+}
+
+function Get-TextHash([string]$s) {
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { ([BitConverter]::ToString($sha.ComputeHash($Utf8NoBom.GetBytes($s))) -replace '-', '').ToLowerInvariant() } finally { $sha.Dispose() }
+}
+
+# Declarations per language, one per line: type, method/function, route, decorator, import. Named group n is the
+# symbol; routes use m (verb) and p (path). Regex, not a parser: good enough to find and rank, never a proof.
+$SymbolRules = @{
+    cs = @(
+        @{ kind = 'route'; rx = '\[(?<m>HttpGet|HttpPost|HttpPut|HttpDelete|HttpPatch|Route|Function)\(\s*"(?<p>[^"]+)"' },
+        @{ kind = 'type'; rx = '^\s*(?:\[[^\]]*\]\s*)*(?:(?:public|internal|private|protected|static|sealed|abstract|partial|readonly|file|unsafe|ref|new)\s+)*(?:class|interface|record|struct|enum)\s+(?:class\s+|struct\s+)?(?<n>[A-Za-z_]\w*)' },
+        @{ kind = 'method'; rx = '^\s*(?:\[[^\]]*\]\s*)*(?:(?:public|internal|private|protected|static|virtual|override|async|sealed|abstract|new|extern|partial|unsafe)\s+)+[\w<>\[\],.?()\s]*?\b(?<n>[A-Za-z_]\w*)\s*(?:<[^>()]*>)?\s*\(' },
+        @{ kind = 'import'; rx = '^\s*using\s+(?:static\s+)?(?<n>[A-Za-z_][\w.]*)\s*;' })
+    ts = @(
+        @{ kind = 'route'; rx = '\b(?:app|router|server)\.(?<m>get|post|put|delete|patch)\(\s*[''"`](?<p>[^''"`]+)' },
+        @{ kind = 'route'; rx = '^\s*\{?\s*path:\s*[''"](?<p>[^''"]*)[''"](?<m>)' },
+        @{ kind = 'decorator'; rx = '^\s*@(?<n>Component|Injectable|NgModule|Directive|Pipe|Controller|Module)\(' },
+        @{ kind = 'type'; rx = '^\s*(?:export\s+)?(?:default\s+)?(?:declare\s+)?(?:abstract\s+)?(?:class|interface|enum|type)\s+(?<n>[A-Za-z_$][\w$]*)' },
+        @{ kind = 'function'; rx = '^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s*\*?\s*(?<n>[A-Za-z_$][\w$]*)' },
+        @{ kind = 'function'; rx = '^\s*(?:export\s+)?(?:const|let)\s+(?<n>[A-Za-z_$][\w$]*)\s*(?::[^=]+)?=\s*(?:async\s+)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*(?::[^=]+)?=>' },
+        @{ kind = 'method'; rx = '^\s+(?:(?:public|private|protected|static|async|readonly|override|abstract|get|set)\s+)*(?<n>[A-Za-z_$][\w$]*)\s*\([^)]*\)\s*(?::\s*[^{;=]+)?\{\s*$' },
+        @{ kind = 'import'; rx = '^\s*import\s+(?:type\s+)?(?:[^''"]*?\s+from\s+)?[''"](?<n>[^''"]+)[''"]' },
+        @{ kind = 'import'; rx = '\brequire\(\s*[''"](?<n>[^''"]+)[''"]\s*\)' })
+    py = @(
+        @{ kind = 'route'; rx = '^\s*@\w+(?:\.\w+)*\.(?<m>get|post|put|delete|patch|route)\(\s*[''"](?<p>[^''"]+)' },
+        @{ kind = 'type'; rx = '^\s*class\s+(?<n>[A-Za-z_]\w*)' },
+        @{ kind = 'function'; rx = '^(?<i>\s*)(?:async\s+)?def\s+(?<n>[A-Za-z_]\w*)' },
+        @{ kind = 'import'; rx = '^\s*from\s+(?<n>[\w.]+)\s+import\b' },
+        @{ kind = 'import'; rx = '^\s*import\s+(?<n>[\w.]+)' })
+    java = @(
+        @{ kind = 'route'; rx = '@(?<m>Get|Post|Put|Delete|Patch|Request)Mapping\(\s*(?:value\s*=\s*|path\s*=\s*)?"(?<p>[^"]*)"' },
+        @{ kind = 'type'; rx = '^\s*(?:@\w+(?:\([^)]*\))?\s*)*(?:(?:public|private|protected|internal|static|final|abstract|sealed|open|data)\s+)*(?:class|interface|enum|record|object)\s+(?<n>[A-Za-z_]\w*)' },
+        @{ kind = 'function'; rx = '^\s*(?:(?:public|private|protected|internal|override|suspend|open)\s+)*fun\s+(?:<[^>]+>\s*)?(?<n>\w+)\s*\(' },
+        @{ kind = 'method'; rx = '^\s*(?:(?:public|private|protected|static|final|abstract|synchronized|default)\s+)+[\w<>\[\],.?\s]*?\b(?<n>[A-Za-z_]\w*)\s*\(' },
+        @{ kind = 'import'; rx = '^\s*import\s+(?:static\s+)?(?<n>[\w.]+)' })
+    go = @(
+        @{ kind = 'type'; rx = '^type\s+(?<n>[A-Za-z_]\w*)\s+(?:struct|interface)' },
+        @{ kind = 'function'; rx = '^func\s+(?:\([^)]*\)\s*)?(?<n>[A-Za-z_]\w*)' })
+}
+# Compiled on first use (most commands never extract symbols), not at every start-up.
+function Initialize-SymbolRules {
+    if ($script:SymbolRulesReady) { return }
+    foreach ($lang in @($SymbolRules.Keys)) { foreach ($rule in $SymbolRules[$lang]) { $rule.rx = [regex]::new($rule.rx, 'Compiled') } }
+    $script:SymbolRulesReady = $true
+}
+$SymbolLanguages = @{ '.cs' = 'cs'; '.ts' = 'ts'; '.tsx' = 'ts'; '.js' = 'ts'; '.jsx' = 'ts'; '.mjs' = 'ts'; '.cjs' = 'ts'; '.py' = 'py'; '.java' = 'java'; '.kt' = 'java'; '.go' = 'go' }
+$SymbolStop = [Collections.Generic.HashSet[string]]::new([string[]]('if', 'for', 'foreach', 'while', 'switch', 'catch', 'using', 'lock', 'return', 'new', 'else', 'do', 'try', 'sizeof', 'typeof', 'nameof', 'function', 'constructor', 'await', 'yield', 'get', 'set', 'when', 'base', 'this', 'super'))
+
+function Get-FileSymbols([string]$full, [string]$lang) {
+    $rows = New-Object Collections.Generic.List[string]
+    try { if ((Get-Item -LiteralPath $full).Length -gt 1MB) { return $rows }; $text = [IO.File]::ReadAllLines($full) } catch { return $rows }
+    Initialize-SymbolRules
+    $rules = $SymbolRules[$lang]
+    for ($i = 0; $i -lt $text.Length; $i++) {
+        $l = $text[$i]
+        if ($l.Length -gt 400 -or $l.Length -lt 3) { continue }   # minified or generated lines, and blanks
+        $c0 = $l.TrimStart(); if (-not $c0.Length -or $c0[0] -in '}', '/', '*', '#') { continue }   # closing braces and comments never declare a symbol (an opening '{' can start a route entry)
+        foreach ($rule in $rules) {
+            $m = $rule.rx.Match($l)
+            if (-not $m.Success) { continue }
+            $n = if ($m.Groups['p'].Success) { ("$($m.Groups['m'].Value) $($m.Groups['p'].Value)").Trim() } else { $m.Groups['n'].Value }
+            if (-not $n -or $SymbolStop.Contains($n)) { continue }
+            $kind = if ($rule.kind -eq 'function' -and $m.Groups['i'].Length -gt 0) { 'method' } else { $rule.kind }
+            $rows.Add("$($i + 1)`t$kind`t$n"); break
+        }
+    }
+    $rows
+}
+
+# Frameworks and libraries named in the repository's manifests (project files, package.json, Python and JVM build files).
+$FrameworkMarkers = [ordered]@{
+    'aspnetcore' = 'Sdk="Microsoft\.NET\.Sdk\.Web"|Include="Microsoft\.AspNetCore\.'; 'azure-functions-isolated' = 'Microsoft\.Azure\.Functions\.Worker'
+    'azure-functions-inproc' = 'Microsoft\.NET\.Sdk\.Functions'; 'mediator-cqrs' = 'Include="MediatR'; 'fluentvalidation' = 'Include="FluentValidation'
+    'ef-core' = 'Include="Microsoft\.EntityFrameworkCore'; 'dapper' = 'Include="Dapper'; 'automapper' = 'Include="AutoMapper'; 'serilog' = 'Include="Serilog'
+    'graphql' = 'Include="(HotChocolate|StrawberryShake|GraphQL)|"graphql"\s*:|"@apollo/client"|(?m)^\s*(graphene|strawberry-graphql)\b'
+    'xunit' = 'Include="xunit"'; 'nunit' = 'Include="NUnit"'; 'mstest' = 'Include="MSTest\.TestFramework"'; 'mocking' = 'Include="(Moq|NSubstitute|FakeItEasy)"'
+    'angular' = '"@angular/core"\s*:'; 'ngrx' = '"@ngrx/store"\s*:'; 'rxjs' = '"rxjs"\s*:'; 'react' = '"react"\s*:'; 'vue' = '"vue"\s*:'; 'nextjs' = '"next"\s*:'
+    'express' = '"express"\s*:'; 'nestjs' = '"@nestjs/core"\s*:'; 'jest' = '"jest"\s*:'; 'karma-jasmine' = '"karma"\s*:|"jasmine-core"\s*:'; 'vitest' = '"vitest"\s*:'
+    'cypress' = '"cypress"\s*:'; 'playwright' = '"@playwright/test"\s*:'
+    'django' = '(?im)(^|[\s"''])django\b'; 'flask' = '(?im)(^|[\s"''])flask\b'; 'fastapi' = '(?im)(^|[\s"''])fastapi\b'; 'sqlalchemy' = '(?im)(^|[\s"''])sqlalchemy\b'
+    'pydantic' = '(?im)(^|[\s"''])pydantic\b'; 'pytest' = '(?im)(^|[\s"''])pytest\b'; 'celery' = '(?im)(^|[\s"''])celery\b'
+    'spring-boot' = 'spring-boot'; 'junit' = '<artifactId>junit|junit-jupiter'; 'gin' = 'gin-gonic/gin'
+}
+$LanguageNames = [ordered]@{ '.cs' = 'C#'; '.ts' = 'TypeScript'; '.tsx' = 'TypeScript'; '.js' = 'JavaScript'; '.jsx' = 'JavaScript'; '.py' = 'Python'; '.java' = 'Java'; '.kt' = 'Kotlin'; '.go' = 'Go'; '.rs' = 'Rust'; '.rb' = 'Ruby'; '.php' = 'PHP'; '.swift' = 'Swift'; '.scala' = 'Scala'; '.sql' = 'SQL'; '.html' = 'HTML'; '.scss' = 'SCSS' }
+
+function Write-TextAtomic([string]$path, [string]$text) {   # a crash mid-write never leaves a half-written memory file
+    [IO.File]::WriteAllText("$path.tmp", $text, $Utf8NoBom)
+    Move-Item -LiteralPath "$path.tmp" $path -Force
+}
+
+function Read-JsonOrRecover([string]$path) {   # unreadable memory is set aside (kept for inspection) and rebuilt
+    if (-not (Test-Path -LiteralPath $path)) { return @{ data = $null; recovered = $false } }
+    try { return @{ data = (Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json); recovered = $false } }
+    catch { Move-Item -LiteralPath $path "$path.corrupt-$((Get-Date).ToString('yyyyMMddHHmmss'))" -Force; return @{ data = $null; recovered = $true } }
+}
+
+function Add-MemoryLog([string]$repoId, [string]$what, [string]$detail) {
+    $log = Join-Path $AkzoHome "maps\$repoId\memory-log.tsv"
+    try {
+        [IO.File]::AppendAllText($log, "$((Get-Date).ToString('s'))`t$what`t$(Protect-Text ($detail -replace '[\t\r\n]+', ' '))`r`n", $Utf8NoBom)
+        if ((Get-Item -LiteralPath $log).Length -gt 200KB) { $keep = @(Get-Content -LiteralPath $log -Encoding UTF8 | Select-Object -Last 1000); [IO.File]::WriteAllLines($log, [string[]]$keep, $Utf8NoBom) }
+    } catch { }   # the log is diagnostics only
+}
+
+function Get-MemoryHitRate([string]$repoId) {   # share of the last 50 synchronizations served from memory without a refresh
+    $log = Join-Path $AkzoHome "maps\$repoId\memory-log.tsv"
+    if (-not (Test-Path -LiteralPath $log)) { return $null }
+    $lines = [IO.File]::ReadAllLines($log)   # not Get-Content with a pipeline: that cost grows with the log
+    $ev = New-Object Collections.Generic.List[string]
+    for ($i = $lines.Length - 1; $i -ge 0 -and $ev.Count -lt 50; $i--) { $w = $lines[$i].Split("`t"); if ($w.Length -ge 2 -and $w[1] -in 'hit', 'refresh', 'rebuild') { $ev.Add($w[1]) } }
+    if (-not $ev.Count) { return $null }
+    $hits = 0; foreach ($e in $ev) { if ($e -eq 'hit') { $hits++ } }
+    [math]::Round(100 * $hits / $ev.Count, 1)
+}
+
+# Verified facts of a repository (maps\<repo-id>\facts.json). A fact is 'verified' while every evidence file still has
+# the content it was verified against, 'stale' when one changed (or a fact it depends on is not verified), 'invalid'
+# when an evidence file is gone; invalid facts expire into facts-expired.json.
+function Sync-Facts($r, $blobs, $retentionDays) {
+    $dir = Join-Path $AkzoHome "maps\$($r.id)"
+    $file = Join-Path $dir 'facts.json'
+    $load = Read-JsonOrRecover $file
+    $facts = @($load.data.facts | Where-Object { $_ })
+    $byId = @{}; foreach ($f in $facts) { $byId[$f.id] = $f }
+    $changed = $load.recovered
+    $now = (Get-Date).ToString('s')
+    $cutoff = if ($retentionDays) { (Get-Date).AddDays(-[int]$retentionDays) } else { $null }
+    foreach ($f in $facts) {
+        $missing = @($f.evidence | Where-Object { -not $blobs.ContainsKey($_.path) })
+        $moved = @($f.evidence | Where-Object { $blobs.ContainsKey($_.path) -and $blobs[$_.path] -ne $_.blob })
+        $old = $cutoff -and $f.verifiedAt -and ([datetime]$f.verifiedAt) -lt $cutoff
+        $status = if ($missing -or $old) { 'invalid' } elseif ($moved) { 'stale' } else { 'verified' }
+        $reason = if ($old) { "retention: verified more than $retentionDays days ago" } elseif ($missing) { "evidence removed: $(@($missing | ForEach-Object { $_.path }) -join ', ')" } elseif ($moved) { "evidence changed: $(@($moved | ForEach-Object { $_.path }) -join ', ')" } else { '' }
+        $f | Add-Member -NotePropertyName _status -NotePropertyValue $status -Force
+        $f | Add-Member -NotePropertyName _reason -NotePropertyValue $reason -Force
+    }
+    foreach ($f in $facts) {   # a fact resting on an unverified fact is not verified either
+        if ($f._status -eq 'verified') {
+            $bad = @($f.dependsOn | Where-Object { $_ -and (-not $byId.ContainsKey($_) -or $byId[$_]._status -ne 'verified') })
+            if ($bad) { $f._status = 'stale'; $f._reason = "depends on unverified $($bad -join ', ')" }
+        }
+    }
+    $expired = @($facts | Where-Object { $_._status -eq 'invalid' })
+    $keep = @($facts | Where-Object { $_._status -ne 'invalid' })
+    foreach ($f in $facts) {
+        if ("$($f.status)" -ne $f._status -or "$($f.reason)" -ne $f._reason) { $changed = $true }
+        $f | Add-Member -NotePropertyName status -NotePropertyValue $f._status -Force
+        $f | Add-Member -NotePropertyName reason -NotePropertyValue $f._reason -Force
+        $f | Add-Member -NotePropertyName checkedAt -NotePropertyValue $now -Force
+        $f.PSObject.Properties.Remove('_status'); $f.PSObject.Properties.Remove('_reason')
+    }
+    if ($expired) {
+        $ef = Join-Path $dir 'facts-expired.json'
+        $old = @((Read-JsonOrRecover $ef).data.facts | Where-Object { $_ })
+        foreach ($f in $expired) { $f | Add-Member -NotePropertyName expiredAt -NotePropertyValue $now -Force }
+        Write-TextAtomic $ef ([pscustomobject]@{ schemaVersion = 1; repo = $r.id; facts = @($old + $expired) } | ConvertTo-Json -Depth 5)
+        Add-MemoryLog $r.id 'expire' "$($expired.Count) fact(s): $(@($expired | ForEach-Object { $_.id }) -join ', ')"
+    }
+    if ($changed -and (Test-Path -LiteralPath $dir)) { Write-TextAtomic $file ([pscustomobject]@{ schemaVersion = 1; repo = $r.id; facts = @($keep) } | ConvertTo-Json -Depth 5) }
+    $stale = @($keep | Where-Object { $_.status -eq 'stale' })
+    if ($stale -and $changed) { Add-MemoryLog $r.id 'stale' "$($stale.Count) fact(s): $(@($stale | ForEach-Object { $_.id }) -join ', ')" }
+    [pscustomobject][ordered]@{
+        path = $file; total = $keep.Count; verified = @($keep | Where-Object { $_.status -eq 'verified' }).Count; stale = $stale.Count
+        expired = $expired.Count; recovered = $load.recovered
+        staleFacts = @($stale | ForEach-Object { "$($_.id): $($_.reason)" })
+        all = @($keep)
+    }
+}
+
+function Sync-Architecture($r, [switch]$Force, [string]$Head) {
+    $out = Join-Path $AkzoHome "maps\$($r.id)"
+    $arch = Join-Path $out 'architecture.json'
+    $index = Join-Path $out 'component-index.tsv'
+    $symFile = Join-Path $out 'symbols.tsv'
+    $head = if ($Head) { $Head } else { "$(Invoke-Quiet git -C $r.path rev-parse HEAD)" }
+    $blobs = Get-FileBlobs $r.path
+    $keys = [string[]]$blobs.Keys; [Array]::Sort($keys, [StringComparer]::Ordinal)
+    $sb = New-Object Text.StringBuilder
+    foreach ($k in $keys) { [void]$sb.Append($k).Append("`t").Append($blobs[$k]).Append("`n") }
+    $fingerprint = Get-TextHash $sb.ToString()
+    $load = Read-JsonOrRecover $arch
+    $prev = $load.data
+    $fresh = $prev -and -not $Force -and $prev.schemaVersion -eq $MemorySchema -and "$($prev.fingerprint)" -eq $fingerprint -and (Test-Path -LiteralPath $index) -and (Test-Path -LiteralPath $symFile)
+    $stats = [ordered]@{ event = 'hit'; symbolsReused = 0; symbolsParsed = 0; symbolsRemoved = 0 }
+    if (-not $fresh) {
+        $stats.event = if ($prev -and $prev.schemaVersion -eq $MemorySchema -and -not $Force) { 'refresh' } else { 'rebuild' }
+        $files = @($blobs.Keys | Sort-Object)
+        $skip = [regex]'(^|/)(bin|obj|node_modules|dist|\.angular|[Gg]enerated)/|\.g\.cs$|\.[Dd]esigner\.cs$'
+        $rx = [ordered]@{}; foreach ($k in $ComponentRoles.Keys) { $rx[$k] = [regex]::new($ComponentRoles[$k], 'IgnoreCase') }
+        $roleCounts = [ordered]@{}; $dirs = @{}; $exts = @{}; $leaves = @{}
+        $lines = New-Object Collections.Generic.List[string]
+        foreach ($p in $files) {
+            if ($skip.IsMatch($p)) { continue }
+            $slash = $p.IndexOf('/')
+            $top = if ($slash -gt 0) { $p.Substring(0, $slash) } else { '.' }
+            $dirs[$top] = 1 + $dirs[$top]
+            $leaf = $p.Substring($p.LastIndexOf('/') + 1)
+            $leaves[$leaf.ToLowerInvariant()] = 1
+            $dot = $leaf.LastIndexOf('.')
+            if ($dot -gt 0) { $e = $leaf.Substring($dot).ToLowerInvariant(); $exts[$e] = 1 + $exts[$e] }
+            foreach ($k in $rx.Keys) { if ($rx[$k].IsMatch($p)) { $lines.Add("$k`t$p"); $roleCounts[$k] = 1 + $roleCounts[$k]; break } }
+        }
+        $stack = New-Object Collections.Generic.List[string]
+        $markers = [ordered]@{ '.sln' = 'dotnet'; '.csproj' = 'dotnet'; 'package.json' = 'node'; 'angular.json' = 'angular'; 'pom.xml' = 'java-maven'; 'build.gradle' = 'java-gradle'; 'go.mod' = 'go'; 'pyproject.toml' = 'python'; 'requirements.txt' = 'python'; 'host.json' = 'azure-functions'; 'dockerfile' = 'docker'; '.graphql' = 'graphql'; '.tf' = 'terraform' }
+        foreach ($m in $markers.Keys) { if (($m.StartsWith('.') -and $exts.ContainsKey($m)) -or $leaves.ContainsKey($m)) { if (-not $stack.Contains($markers[$m])) { $stack.Add($markers[$m]) } } }
+        $projects = @($files | Where-Object { $_ -match '\.(sln|csproj|fsproj)$|(^|/)(package\.json|pom\.xml|build\.gradle|go\.mod|pyproject\.toml)$' -and -not $skip.IsMatch($_) } | Select-Object -First 40)
+        New-Item -ItemType Directory -Force -Path $out | Out-Null
+        Protect-Directory $out | Out-Null   # owner-only memory
+        Write-TextAtomic $index ((@($lines | Sort-Object) -join "`r`n") + "`r`n")
+
+        # Symbols: re-extract only files whose blob changed since the last run; deleted and renamed files drop out.
+        $old = @{}
+        if ($stats.event -eq 'refresh') {
+            try { foreach ($l in [IO.File]::ReadAllLines($symFile)) { $c = $l.Split("`t"); if ($c.Count -ge 5) { if (-not $old.ContainsKey($c[0])) { $old[$c[0]] = @{ blob = $c[1]; rows = New-Object Collections.Generic.List[string] } }; if ($c[2] -ne '0') { $old[$c[0]].rows.Add("$($c[2])`t$($c[3])`t$($c[4])") } } } }
+            catch { $old = @{}; $stats.event = 'rebuild' }
+        }
+        $symLines = New-Object Collections.Generic.List[string]
+        foreach ($p in $files) {
+            if ($skip.IsMatch($p) -or $p -match '\.min\.js$') { continue }
+            $dot = $p.LastIndexOf('.'); if ($dot -lt 0) { continue }
+            $lang = $SymbolLanguages[$p.Substring($dot).ToLowerInvariant()]
+            if (-not $lang) { continue }
+            $blob = $blobs[$p]
+            if ($old.ContainsKey($p) -and $old[$p].blob -eq $blob) { $rows = $old[$p].rows; $stats.symbolsReused++ }
+            else { $rows = Get-FileSymbols (Join-Path $r.path $p) $lang; $stats.symbolsParsed++ }
+            $old.Remove($p)
+            if ($rows.Count) { foreach ($row in $rows) { $symLines.Add("$p`t$blob`t$row") } } else { $symLines.Add("$p`t$blob`t0`t-`t") }
+        }
+        $stats.symbolsRemoved = $old.Count
+        Write-TextAtomic $symFile (($symLines -join "`r`n") + "`r`n")
+
+        $manifests = @($files | Where-Object { $_ -match '\.(cs|fs|vb)proj$|(^|/)(Directory\.Packages\.props|package\.json|pyproject\.toml|Pipfile|setup\.py|pom\.xml|build\.gradle(\.kts)?|go\.mod)$|(^|/)requirements[^/]*\.txt$' -and -not $skip.IsMatch($_) } | Select-Object -First 80)
+        $frameworks = [ordered]@{}
+        foreach ($mf in $manifests) {
+            $t = try { [IO.File]::ReadAllText((Join-Path $r.path $mf)) } catch { '' }
+            foreach ($k in $FrameworkMarkers.Keys) { if (-not $frameworks.Contains($k) -and $t -match $FrameworkMarkers[$k]) { $frameworks[$k] = $mf } }
+        }
+        $languages = [ordered]@{}
+        foreach ($e in $exts.Keys) { if ($LanguageNames.Contains($e)) { $languages[$LanguageNames[$e]] = $exts[$e] + $languages[$LanguageNames[$e]] } }
+        $routeCount = @($symLines | Where-Object { $_.Split("`t")[3] -eq 'route' }).Count
+        $count = { param($k) [int]$roleCounts[$k] }
+        $patterns = @(
+            if ((& $count 'handler') -and ((& $count 'command') + (& $count 'query'))) { "command/query objects with handlers ($(& $count 'command') commands, $(& $count 'query') queries, $(& $count 'handler') handlers)" }
+            if ($frameworks.Contains('mediator-cqrs')) { "mediator dispatch ($($frameworks['mediator-cqrs']))" }
+            if (& $count 'validator') { "validation in separate validator classes ($(& $count 'validator') files)" }
+            if (& $count 'repository') { "data access behind repositories or contexts ($(& $count 'repository') files)" }
+            if (& $count 'endpoint') { "entry points in controllers, functions, or routers ($(& $count 'endpoint') files)" }
+            if ($routeCount) { "declared routes ($routeCount in symbols.tsv)" }
+            if ((& $count 'ui') -and (& $count 'ui-service')) { "UI components with services ($(& $count 'ui') components, $(& $count 'ui-service') services)" }
+            if (& $count 'di') { "dependency registration modules ($(& $count 'di') files)" }
+            $layers = @($projects + @($dirs.Keys) | Where-Object { $_ -match '(Domain|Application|Infrastructure)' })
+            if ($layers.Count -ge 2) { "layered projects by name ($(@($layers | Select-Object -First 4) -join ', '))" }
+            if (& $count 'test') { "tests ($(& $count 'test') files)" })
+        $prev = [pscustomobject][ordered]@{
+            schemaVersion = $MemorySchema; repo = $r.id; commit = $head; fingerprint = $fingerprint; generated = (Get-Date).ToString('s'); files = $files.Count; stack = @($stack)
+            languages = [pscustomobject]$languages
+            frameworks = @($frameworks.Keys | ForEach-Object { "$_ ($($frameworks[$_]))" })
+            patterns = [pscustomobject][ordered]@{ status = 'inferred from file names and manifests; confirm by reading a sibling feature before relying on it'; items = $patterns }
+            topDirs = @($dirs.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 15 | ForEach-Object { "$($_.Key) ($($_.Value))" })
+            extensions = @($exts.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 12 | ForEach-Object { "$($_.Key) ($($_.Value))" })
+            projects = $projects; roleCounts = [pscustomobject]$roleCounts; symbols = $symLines.Count; specsDir = "$($r.cfg.specsDir)"
+        }
+        Write-TextAtomic $arch ($prev | ConvertTo-Json -Depth 4)
+        $detail = "parsed $($stats.symbolsParsed), reused $($stats.symbolsReused), removed $($stats.symbolsRemoved)$(if ($load.recovered) { ', architecture.json was unreadable' })"
+        Add-MemoryLog $r.id $stats.event $detail
+    } else { Add-MemoryLog $r.id 'hit' '' }
+    $script:LastBlobs = $blobs   # reused by the caller (facts, context) without hashing again
+    [pscustomobject][ordered]@{
+        architecture = $arch; componentIndex = $index; symbols = $symFile; knowledge = (Join-Path $AkzoHome "maps\$($r.id).md")
+        commit = $prev.commit; refreshed = -not $fresh; files = $prev.files; stack = (@($prev.stack) -join ', ')
+        languages = (@($prev.languages.PSObject.Properties | ForEach-Object { "$($_.Name) $($_.Value)" }) -join ', ')
+        frameworks = (@($prev.frameworks) -join ', ')
+        patterns = @($prev.patterns.items)
+        topDirs = (@($prev.topDirs) | Select-Object -First 8) -join ', '
+        roles = (@($prev.roleCounts.PSObject.Properties | ForEach-Object { "$($_.Name) $($_.Value)" }) -join ', ')
+        memory = [pscustomobject][ordered]@{ event = $stats.event; symbolsReused = $stats.symbolsReused; symbolsParsed = $stats.symbolsParsed; symbolsRemoved = $stats.symbolsRemoved; hitRatePct = (Get-MemoryHitRate $r.id) }
+    }
+}
+
+# Inputs are data, never instructions: flag text that tries to steer the agent so it is not followed.
+$InstructionPatterns = @(
+    '(?i)\b(ignore|disregard|forget)\s+(all\s+|any\s+|the\s+)?(previous|prior|above|earlier|system)\s+(instructions|prompts?|rules)',
+    '(?i)\byou\s+are\s+now\s+(a|an|the|in)\b', '(?i)\b(new|updated)\s+system\s+prompt\b', '(?i)\bdeveloper\s+mode\b',
+    '(?i)\bdo\s+not\s+(tell|inform|show)\s+the\s+(user|developer)\b', '(?i)\b(skip|bypass|disable)\s+(the\s+)?(approval|gates?|tests?|review|security)\b',
+    '(?i)\b(curl|wget|iwr|Invoke-WebRequest)\b[^\r\n|]*\|\s*(sh|bash|iex|Invoke-Expression)\b', '(?i)\bInvoke-Expression\b|\biex\s*\(',
+    '(?i)\b(push|commit)\s+(directly\s+)?to\s+(main|master|production)\b')
+function Find-InstructionText([string]$text) {
+    if (-not $text) { return '' }
+    if ($text.Length -gt 400KB) { $text = $text.Substring(0, 400KB) }
+    foreach ($p in $InstructionPatterns) { $m = [regex]::Match($text, $p); if ($m.Success) { $s = $m.Value -replace '\s+', ' '; return $(if ($s.Length -gt 80) { $s.Substring(0, 80) } else { $s }) } }
+    ''
+}
+
+# Secrets never go into memory: a value that looks like one is refused (the message does not repeat it).
+$SecretPatterns = [ordered]@{
+    # Order matters: the first match names the finding, so specific, high-certainty patterns come before the generic
+    # 'credential assignment' (which also matches many harmless lines and is therefore only a "review" finding).
+    'connection string with credentials' = '(?i)(AccountKey|SharedAccessKey|Password|Pwd)=[^;\s]{4,}'
+    'private key' = '-----BEGIN [A-Z ]*PRIVATE KEY-----'
+    'GitHub token' = '\b(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}\b|\bgithub_pat_[A-Za-z0-9_]{20,}'
+    'Sonar token' = '\bsq[uap]_[A-Za-z0-9]{20,}\b'
+    'AWS access key' = '\bAKIA[0-9A-Z]{16}\b'
+    'Slack token' = '\bxox[abprs]-[A-Za-z0-9-]{10,}'
+    'JSON web token' = '\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}'
+    'bearer token' = '(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{20,}'
+    'shared access signature' = '(?i)[?&]sig=[A-Za-z0-9%+/=]{20,}'
+    'credential assignment' = '(?i)\b(password|passwd|pwd|secret|api[_-]?key|access[_-]?key|client[_-]?secret|auth[_-]?token|token)\b\s*[=:]\s*["'']?[^\s"'';,]{6,}'
+}
+function Find-Secret([string]$text) { foreach ($k in $SecretPatterns.Keys) { if ($text -match $SecretPatterns[$k]) { return $k } }; '' }
+
+# Search terms: camelCase and separators split, lower case, simple suffix stemming (validation/validator/validate -> valid).
+$StopWords = [Collections.Generic.HashSet[string]]::new([string[]]('the', 'and', 'for', 'with', 'from', 'that', 'this', 'when', 'then', 'given', 'should', 'must', 'shall', 'will', 'can', 'into', 'are', 'was', 'not', 'all', 'any', 'each', 'add', 'new', 'use', 'user', 'users', 'allow', 'able', 'via', 'per', 'its', 'has', 'have', 'been', 'only', 'also', 'such', 'than', 'cs', 'ts', 'js', 'py', 'java', 'go', 'src', 'app', 'lib', 'test', 'tests', 'spec', 'index', 'main', 'component', 'html'))
+function Get-Stem([string]$w) {
+    foreach ($s in 'ations', 'ation', 'ators', 'ator', 'ating', 'ates', 'ated', 'ate', 'ings', 'ing', 'ies', 'ed', 's') {   # no -er/-es: order, service stay whole
+        if ($w.EndsWith($s) -and $w.Length - $s.Length -ge 3 -and -not ($s -eq 's' -and $w.EndsWith('ss'))) { return $w.Substring(0, $w.Length - $s.Length) + $(if ($s -eq 'ies') { 'y' } else { '' }) }
+    }
+    $w
+}
+function Get-Tokens([string]$s) {   # loops, not pipelines: called for every path and many symbols
+    $s = [regex]::Replace([regex]::Replace($s, '([a-z0-9])([A-Z])', '$1 $2'), '([A-Z]+)([A-Z][a-z])', '$1 $2')
+    $out = New-Object Collections.Generic.List[string]
+    foreach ($w in [regex]::Split($s.ToLowerInvariant(), '[^a-z0-9]+')) {
+        if ($w.Length -ge 2 -and -not $StopWords.Contains($w)) { $st = Get-Stem $w; if (-not $out.Contains($st)) { $out.Add($st) } }
+    }
+    $out.ToArray()
+}
+
+# Sonar setup of a repository, read from its tracked files and this machine. No network; a token is only
+# reported as set or not, never read out.
+function Get-SonarSetup($r, [switch]$Brief) {   # -Brief: skip the machine-tool detection (slow Get-Command calls), as `task` does on every call
+    $root = $r.path
+    # Files that can name Sonar settings, analyzers, or coverage tools. When the architecture sync just ran, its file list is
+    # reused (no extra git call); otherwise git is asked.
+    $sonarFiles = '(^|/)sonar-project\.properties$|\.(cs|vb)proj$|(^|/)Directory\.(Build|Packages)\.props$|\.ya?ml$|(^|/)Jenkinsfile$|(^|/)package\.json$|(^|/)\.editorconfig$|\.globalconfig$|\.ruleset$'
+    $all = if ($script:LastBlobs -and $script:LastBlobs.Count) { @($script:LastBlobs.Keys) } else { @(Invoke-Quiet git -C $root -c core.quotepath=off ls-files -co --exclude-standard) }
+    $files = @($all | Where-Object { $_ -match $sonarFiles -and $_ -notmatch '(^|/)(node_modules|bin|obj|dist)/' })
+    $read = { param($f) try { [IO.File]::ReadAllText((Join-Path $root $f)) } catch { '' } }
+    $props = [ordered]@{}
+    $propFile = $files | Where-Object { $_ -match '(^|/)sonar-project\.properties$' } | Sort-Object Length | Select-Object -First 1
+    if ($propFile) {
+        foreach ($l in (& $read $propFile) -split '\r?\n') { if ($l -match '^\s*(sonar\.[\w.]+)\s*[=:]\s*(.*)$') { $props[$Matches[1]] = $Matches[2].Trim() } }
+    }
+    $key = $props['sonar.projectKey']; $org = $props['sonar.organization']
+    $pipelines = @(); $analyzers = [ordered]@{}; $coverage = [ordered]@{}; $rules = @()
+    foreach ($f in $files) {
+        $leaf = $f.Substring($f.LastIndexOf('/') + 1)
+        if ($f -match '\.ya?ml$' -or $leaf -eq 'Jenkinsfile') {
+            $t = & $read $f
+            if ($t -match '(?i)SonarQube|SonarCloud|sonarscanner|sonar-scanner|sonar\.projectKey') {
+                $pipelines += $f
+                if (-not $key -and $t -match '(?:projectKey:\s*|/k:|sonar\.projectKey=)["'']?([\w.:-]+)') { $key = $Matches[1] }
+                if (-not $org -and $t -match '(?:organization:\s*|/o:|sonar\.organization=)["'']?([\w.-]+)') { $org = $Matches[1] }
+            }
+        } elseif ($f -match '\.(cs|vb)proj$' -or $leaf -match '^Directory\.(Build|Packages)\.props$') {
+            $t = & $read $f
+            foreach ($m in [regex]::Matches($t, '(?i)Include="(SonarAnalyzer\.[\w.]+|coverlet\.[\w.]+|Microsoft\.Testing\.Extensions\.CodeCoverage|Microsoft\.CodeCoverage)"')) {
+                $n = $m.Groups[1].Value
+                if ($n -like 'SonarAnalyzer*') { if (-not $analyzers[$n]) { $analyzers[$n] = $f } } elseif (-not $coverage[$n]) { $coverage[$n] = $f }
+            }
+            if ($t -match '(?i)<TreatWarningsAsErrors>\s*true') { $rules += "$f (TreatWarningsAsErrors)" }
+            if ($t -match '(?i)<CodeAnalysisRuleSet>') { $rules += "$f (CodeAnalysisRuleSet)" }
+        } elseif ($leaf -eq 'package.json') {
+            $t = & $read $f
+            if ($t -match '"eslint-plugin-sonarjs"' -and -not $analyzers['eslint-plugin-sonarjs']) { $analyzers['eslint-plugin-sonarjs'] = $f }
+            foreach ($n in 'karma-coverage', 'nyc', 'c8', '@vitest/coverage-v8', 'jest') { if ($t -match "`"$([regex]::Escape($n))`"" -and -not $coverage[$n]) { $coverage[$n] = $f } }
+        } elseif ($leaf -ne 'sonar-project.properties') { $rules += $f }   # .editorconfig, .globalconfig, rule sets
+    }
+    $hostUrl = if ($env:SONAR_HOST_URL) { $env:SONAR_HOST_URL } elseif ($props['sonar.host.url']) { $props['sonar.host.url'] } elseif ($org) { 'https://sonarcloud.io' } else { '' }
+    $tokenSet = [bool]$env:SONAR_TOKEN
+    $tool = { param($n) [bool](Get-Command $n -ErrorAction SilentlyContinue) }
+    $tools = if ($Brief) { 'run the sonar command to detect' } else {
+    # shortcut: only the VS Code extension folder is checked; Visual Studio's SonarQube for IDE is not detected.
+    $ide = [bool](Get-ChildItem (Join-Path $env:USERPROFILE '.vscode\extensions') -Directory -Filter 'sonarsource.sonarlint-vscode-*' -ErrorAction SilentlyContinue | Select-Object -First 1)
+        [pscustomobject][ordered]@{ sonarCli = (& $tool 'sonar'); dotnetSonarscanner = (& $tool 'dotnet-sonarscanner'); sonarScanner = (& $tool 'sonar-scanner'); ideExtension = $ide } }
+    [pscustomobject][ordered]@{
+        projectKey = "$key"; organization = "$org"; host = $hostUrl; tokenSet = $tokenSet
+        serverQueries = [bool]($key -and $hostUrl -and $tokenSet)
+        propertiesFile = "$propFile"; pipelines = @($pipelines)
+        analyzers = @($analyzers.Keys | ForEach-Object { "$_ ($($analyzers[$_]))" })
+        coverageTools = @($coverage.Keys | ForEach-Object { "$_ ($($coverage[$_]))" })
+        ruleConfig = @($rules | Select-Object -First 15)
+        exclusions = @('sonar.exclusions', 'sonar.coverage.exclusions', 'sonar.cpd.exclusions', 'sonar.test.inclusions' | Where-Object { $props[$_] } | ForEach-Object { "$_=$($props[$_])" })
+        tools = $tools
+    }
+}
+
+function Join-Ranges([int[]]$n) {   # 3,4,5,9 -> "3-5, 9"
+    $out = @(); $n = @($n | Sort-Object -Unique)
+    for ($i = 0; $i -lt $n.Count; $i++) {
+        $s = $n[$i]; while ($i + 1 -lt $n.Count -and $n[$i + 1] -eq $n[$i] + 1) { $i++ }
+        $out += $(if ($n[$i] -eq $s) { "$s" } else { "$s-$($n[$i])" })
+    }
+    $out -join ', '
+}
+
+# Read-only Sonar Web API call. The token comes from SONAR_TOKEN and goes only into the request header.
+# The token is sent only over https (a loopback server is exempt, for local testing) and never follows a redirect.
+function Get-HostIssue([string]$url) {
+    try { $u = [Uri]$url } catch { return "'$url' is not a valid URL" }
+    if ($u.Scheme -eq 'https') { return '' }
+    if ($u.Scheme -eq 'http' -and $u.Host -in 'localhost', '127.0.0.1', '[::1]', '::1') { return '' }
+    "the token would travel unencrypted ($($u.Scheme) to $($u.Host)); use https"
+}
+function Invoke-SonarApi([string]$hostUrl, [string]$apiPath) {
+    $issue = Get-HostIssue $hostUrl; if ($issue) { throw "Refused: $issue." }
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    $auth = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("$($env:SONAR_TOKEN):"))
+    Invoke-RestMethod -Method Get -Uri ($hostUrl.TrimEnd('/') + '/' + $apiPath) -Headers @{ Authorization = "Basic $auth" } -UseBasicParsing -TimeoutSec 60 -MaximumRedirection 0
+}
+
+# Lines added or changed against HEAD per repo-relative path (tracked edits and untracked files).
+function Get-ChangedLines([string]$root) {
+    $map = @{}; $cur = $null
+    foreach ($l in @(Invoke-Quiet git -C $root -c core.quotepath=off diff -U0 --no-color --no-ext-diff HEAD)) {
+        if ($l -match '^\+\+\+ (.+)$') {
+            $cur = if ($Matches[1] -eq '/dev/null') { $null } else { $Matches[1] -replace '^b/', '' }
+            if ($cur -and -not $map.ContainsKey($cur)) { $map[$cur] = New-Object Collections.Generic.List[int] }
+        } elseif ($cur -and $l -match '^@@ -\S+ \+(\d+)(?:,(\d+))? @@') {
+            $count = if ($Matches[2]) { [int]$Matches[2] } else { 1 }
+            for ($i = 0; $i -lt $count; $i++) { $map[$cur].Add([int]$Matches[1] + $i) }
+        }
+    }
+    foreach ($u in @(Invoke-Quiet git -C $root -c core.quotepath=off ls-files --others --exclude-standard)) {
+        $n = @(Get-Content -LiteralPath (Join-Path $root $u) -ErrorAction SilentlyContinue).Count
+        $lines = New-Object Collections.Generic.List[int]; for ($i = 1; $i -le $n; $i++) { $lines.Add($i) }
+        $map[$u] = $lines
+    }
+    $map
+}
+
+# Per-file line hits and partly covered branch lines from Cobertura XML or LCOV, keyed by normalized full path.
+# shortcut: OpenCover XML is not read; configure the coverage tool for Cobertura or LCOV output.
+function Read-CoverageReport([string]$file, [string]$repoRoot) {
+    $result = @{}
+    $norm = { param($p) ($p -replace '\\', '/').ToLowerInvariant() }
+    $entry = { param($p) $k = & $norm $p; if (-not $result.ContainsKey($k)) { $result[$k] = @{ hits = @{}; partial = @{} } }; $result[$k] }
+    $text = [IO.File]::ReadAllText($file)
+    if ($text -match '^\s*(<\?xml|<coverage)') {
+        $xml = [xml]$text
+        $sources = @($xml.SelectNodes('//sources/source') | ForEach-Object { $_.InnerText.Trim() }) + @($repoRoot)
+        foreach ($c in $xml.SelectNodes('//class')) {
+            $fn = $c.GetAttribute('filename')
+            $full = if ([IO.Path]::IsPathRooted($fn)) { $fn } else { $hit = $sources | Where-Object { $_ -and (Test-Path -LiteralPath (Join-Path $_ $fn)) } | Select-Object -First 1; if ($hit) { Join-Path $hit $fn } else { $fn } }
+            $e = & $entry $full
+            foreach ($ln in $c.SelectNodes('lines/line')) {
+                $n = [int]$ln.GetAttribute('number'); $h = [long]$ln.GetAttribute('hits')
+                if (-not $e.hits.ContainsKey($n) -or $e.hits[$n] -lt $h) { $e.hits[$n] = $h }
+                if ($ln.GetAttribute('branch') -eq 'true' -and $ln.GetAttribute('condition-coverage') -match '\((\d+)/(\d+)\)' -and [int]$Matches[1] -lt [int]$Matches[2]) { $e.partial[$n] = $true }
+            }
+        }
+    } else {
+        $e = $null; $branches = @{}
+        foreach ($l in $text -split '\r?\n') {
+            if ($l -match '^SF:(.+)$') { $p = $Matches[1].Trim(); $e = & $entry $(if ([IO.Path]::IsPathRooted($p)) { $p } else { Join-Path $repoRoot $p }); $branches = @{} }
+            elseif ($e -and $l -match '^DA:(\d+),(\d+)') { $n = [int]$Matches[1]; $h = [int]$Matches[2]; if (-not $e.hits.ContainsKey($n) -or $e.hits[$n] -lt $h) { $e.hits[$n] = $h } }
+            elseif ($e -and $l -match '^BRDA:(\d+),[^,]*,[^,]*,(\S+)') { $n = [int]$Matches[1]; if (-not $branches[$n]) { $branches[$n] = @(0, 0) }; $branches[$n][1]++; if ($Matches[2] -ne '-' -and [int]$Matches[2] -gt 0) { $branches[$n][0]++ } }
+            elseif ($e -and $l -eq 'end_of_record') { foreach ($n in $branches.Keys) { if ($branches[$n][0] -lt $branches[$n][1]) { $e.partial[$n] = $true } }; $e = $null }
+        }
+    }
+    $result
+}
+
+# ---- Corporate security (G8) ------------------------------------------------------------------------------------
+# Authorization to process a repository comes from an administrator policy (machine policy.json) or, where the policy
+# allows it, from the developer's recorded statement ('authorize'). Without either, repository processing is refused
+# (fail closed). A policy counts as managed only when the current user cannot write it; everything the developer
+# records is reported as their statement, never as corporate approval.
+$MachinePolicy = if ($env:AKZO_AGENT_MACHINE_POLICY) { $env:AKZO_AGENT_MACHINE_POLICY } else { Join-Path $env:ProgramData 'AkzoAgent\policy.json' }
+$UserPolicy = Join-Path $AkzoHome 'policy.json'
+$AuthFile = Join-Path $AkzoHome 'authorizations.json'
+$Classifications = 'public', 'internal', 'confidential', 'restricted'
+
+function Test-UserCanWrite([string]$file) {
+    try { $s = [IO.File]::Open($file, 'Open', 'Write', 'ReadWrite'); $s.Dispose(); $true } catch [UnauthorizedAccessException] { $false } catch { $true }
+}
+
+function Read-Policy {
+    foreach ($p in @($MachinePolicy, $UserPolicy)) {
+        if (-not (Test-Path -LiteralPath $p)) { continue }
+        try { $d = Get-Content -LiteralPath $p -Raw -Encoding UTF8 | ConvertFrom-Json }
+        catch { return [pscustomobject]@{ path = $p; data = $null; managed = $false; error = "unreadable policy file: $($_.Exception.Message)" } }
+        return [pscustomobject]@{ path = $p; data = $d; managed = -not (Test-UserCanWrite $p); error = '' }
+    }
+    [pscustomobject]@{ path = ''; data = $null; managed = $false; error = '' }
+}
+
+function Read-Authorizations {   # the developer's recorded statements; unreadable -> set aside, treated as none (fail closed)
+    $load = Read-JsonOrRecover $AuthFile
+    if ($load.data) { $load.data } else { [pscustomobject]@{ schemaVersion = 1; repos = [pscustomobject]@{} } }
+}
+
+function Get-HostName([string]$url) { try { ([Uri]$url).Host.ToLowerInvariant() } catch { '' } }
+
+function Get-Authorization($r) {
+    $pol = Read-Policy
+    $att = (Read-Authorizations).repos.$($r.id)
+    $rp = if ($pol.data) { $pol.data.repositories.$($r.id) } else { $null }
+    $def = if ($pol.data) { $pol.data.defaults } else { $null }
+    $a = [ordered]@{
+        repo = $r.id; status = 'NOT_AUTHORIZED'; source = ''; managed = $false; reference = ''; policyReference = "$($pol.data.reference)"; policyPath = $pol.path
+        classification = "$(if ($rp.classification) { $rp.classification } elseif ($att.classification) { $att.classification } elseif ($def.classification) { $def.classification } else { 'unclassified' })"
+        memory = "$(if ($rp.memory) { $rp.memory } elseif ($def.memory) { $def.memory } else { 'allowed' })"
+        retentionDays = $(if ($rp.retentionDays) { [int]$rp.retentionDays } elseif ($def.retentionDays) { [int]$def.retentionDays } else { $null })
+        approvedModels = @($pol.data.approvedModels | Where-Object { $_ }); model = "$($att.model)"
+        allowedHosts = @(); reason = ''; recordedBy = "$($att.recordedBy)"; recordedAt = "$($att.recordedAt)"
+    }
+    $hosts = @(@($pol.data.allowedHosts) + @($rp.allowedHosts) | Where-Object { $_ })
+    $attestOk = -not ($pol.data -and $pol.data.allowDeveloperAttestation -eq $false)
+    if ($attestOk) { $hosts += @($att.allowedHosts | Where-Object { $_ }) }
+    $a.allowedHosts = @($hosts | ForEach-Object { "$_".ToLowerInvariant() } | Select-Object -Unique)
+    if ($pol.error) { $a.status = 'BLOCKED'; $a.reason = "$($pol.error) ($($pol.path)); fix or remove it, processing stays blocked until then"; return [pscustomobject]$a }
+    if ($rp) {
+        if ($rp.authorized -ne $true) { $a.status = 'BLOCKED'; $a.reason = "policy does not authorize this repository$(if ($rp.reason) { ": $($rp.reason)" })"; $a.source = $pol.path; return [pscustomobject]$a }
+        $a.status = 'AUTHORIZED'; $a.source = $pol.path; $a.managed = $pol.managed; $a.reference = "$($rp.reference)"
+    } elseif ($att -and $attestOk) {
+        $a.status = 'ATTESTED'; $a.source = $AuthFile; $a.reference = "$($att.reference)"
+        if ($a.classification -eq 'restricted') { $a.status = 'NOT_AUTHORIZED'; $a.reason = 'restricted data needs an administrator policy that lists this repository; a developer statement is not enough' }
+    } else {
+        $a.reason = if (-not $attestOk) { "the policy ($($pol.path)) requires an administrator to list this repository" } else { 'no authorization recorded for this repository' }
+    }
+    if ($a.status -in 'AUTHORIZED', 'ATTESTED' -and $a.approvedModels.Count -and $a.model -and -not ($a.approvedModels -contains $a.model)) {
+        $a.status = 'BLOCKED'; $a.reason = "model '$($a.model)' is not in the policy's approvedModels ($($a.approvedModels -join ', '))"
+    }
+    [pscustomobject]$a
+}
+
+function Get-PreflightRefusal($auth) {   # '' when processing may go ahead, else the status the caller reports
+    if ($auth.status -in 'AUTHORIZED', 'ATTESTED') { return '' }
+    if ($auth.status -eq 'BLOCKED') { 'BLOCKED_BY_POLICY' } else { 'NEEDS_AUTHORIZATION' }
+}
+
+function Assert-Preflight($r) {   # for commands without a JSON status: refuse with the authorization that is missing
+    $auth = Get-Authorization $r
+    $refusal = Get-PreflightRefusal $auth
+    $hint = if ($refusal -eq 'NEEDS_AUTHORIZATION') { 'Record an authorization you hold: authorize -Repo ' + $r.id + ' -Reference "<approval reference>" -Classification <public|internal|confidential>.' } else { '' }
+    if ($refusal) { throw "${refusal}: repository '$($r.id)' - $($auth.reason). $hint" }
+    $auth
+}
+
+function Protect-Directory([string]$dir) {   # owner-only access, plus SYSTEM and Administrators so backup and endpoint protection keep working
+    try {
+        if (-not (Test-Path -LiteralPath $dir)) { return $false }
+        if (Test-ProtectedDirectory $dir) { return $true }
+        $sec = New-Object Security.AccessControl.DirectorySecurity
+        $sec.SetAccessRuleProtection($true, $false)
+        foreach ($sid in @([Security.Principal.WindowsIdentity]::GetCurrent().User, (New-Object Security.Principal.SecurityIdentifier 'S-1-5-18'), (New-Object Security.Principal.SecurityIdentifier 'S-1-5-32-544'))) {
+            $sec.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($sid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+        }
+        Set-Acl -LiteralPath $dir -AclObject $sec
+        $true
+    } catch { $false }
+}
+
+function Test-ProtectedDirectory([string]$dir) {
+    try {
+        $acl = (New-Object IO.DirectoryInfo $dir).GetAccessControl([Security.AccessControl.AccessControlSections]::Access)
+        $ok = @([Security.Principal.WindowsIdentity]::GetCurrent().User.Value, 'S-1-5-18', 'S-1-5-32-544')
+        $acl.AreAccessRulesProtected -and -not @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]) | Where-Object { $_.AccessControlType -eq 'Allow' -and $ok -notcontains $_.IdentityReference.Value }).Count
+    } catch { $false }
+}
+function Protect-Text([string]$s) {   # secret-looking values replaced before anything is logged, reported, or output
+    if (-not $s) { return $s }
+    foreach ($k in $SecretPatterns.Keys) { $s = [regex]::Replace($s, $SecretPatterns[$k], "[REDACTED:$k]") }
+    $s
+}
+
+# Command guard: the agent checks every terminal command that is not a helper call. BLOCK is never run (no approval
+# can release it); NEEDS_APPROVAL runs only after the developer approves that command; ALLOW runs.
+$CommandRules = @(
+    @{ d = 'BLOCK'; c = 'security-tampering'; rx = '(?i)\b(Set|Add|Remove)-MpPreference\b|\b(Stop|Set)-Service\b[^\r\n]*\b(WinDefend|Sense|MsMpSvc|WdNisSvc)\b|\bsc(\.exe)?\s+(stop|config|delete)\s+(WinDefend|Sense)\b|\bnetsh\s+advfirewall\b|\b(Set|New|Remove)-NetFirewall\w*\b|\bbcdedit\b|\bauditpol\b|\bwevtutil\s+cl\b|\bClear-EventLog\b|\bUninstall-WindowsFeature\b' }
+    @{ d = 'BLOCK'; c = 'execution-policy'; rx = '(?i)\bSet-ExecutionPolicy\b|-ExecutionPolicy\s+(Bypass|Unrestricted)\b|-ep\s+(bypass|unrestricted)\b' }
+    @{ d = 'BLOCK'; c = 'registry-or-policy'; rx = '(?i)\breg(\.exe)?\s+(add|delete|import|load)\b|\b(Set|New|Remove)-ItemProperty\b[^\r\n]*\bHK(LM|CU|U|CR)\b|\bsecedit\b|\bgpupdate\b|\bnet(\.exe)?\s+(user|localgroup)\b|\b(Add|Remove)-LocalGroupMember\b|\bicacls\b[^\r\n]*/grant\b[^\r\n]*\b(Everyone|Users)\b' }
+    @{ d = 'BLOCK'; c = 'privilege-escalation'; rx = '(?i)\brunas(\.exe)?\b|-Verb\s+RunAs\b|\bsudo\b|\bpsexec\b' }
+    # Categories, not offensive-tool names: a signature list of attack tools inside this script is itself flagged by
+    # endpoint protection (AMSI), and hiding such strings would be evasion.
+    @{ d = 'BLOCK'; c = 'credential-access'; rx = '(?i)\bcmdkey\b|\bvaultcmd\b|\bGet-StoredCredential\b|\bConvertFrom-SecureString\b|\bExport-PfxCertificate\b|\.git-credentials\b|\bgit\s+credential\s+(fill|approve)\b|\bdpapi\b' }
+    @{ d = 'BLOCK'; c = 'remote-code-execution'; rx = '(?i)\bInvoke-Expression\b|\biex\b|-EncodedCommand\b|\s-enc\s|\|\s*(sh|bash|pwsh|powershell|cmd)(\.exe)?\b|\bStart-BitsTransfer\b|\bmshta\b' }
+    @{ d = 'BLOCK'; c = 'external-transfer'; rx = '(?i)\b(curl|wget)(\.exe)?\b[^\r\n]*(\s-T\s|--upload-file|\s-F\s|--form|-d\s*@|--data(-binary)?\s*@)|\bInvoke-(WebRequest|RestMethod)\b[^\r\n]*(-Method\s+(Post|Put|Patch)|-InFile)\b|\b(scp|sftp|ftp|rsync|rclone|gsutil)\b|\bSend-MailMessage\b|\baz\s+storage\b|\baws\s+s3\s+(cp|sync|mv)\b|\btransfer\.sh\b|\bpastebin\b|\bngrok\b|\bnc(at)?\s+-|\bgit\s+remote\s+(add|set-url)\b|\bgh\s+gist\b|\bCompress-Archive\b[^\r\n]*\\\\' }
+    @{ d = 'NEEDS_APPROVAL'; c = 'destructive'; rx = '(?i)\bRemove-Item\b[^\r\n]*-Recurse\b|\brm\s+-[a-z]*r|\brmdir\s+/s\b|\bdel\s+/s\b|\bgit\s+(reset\s+--hard|clean\s+-[a-z]*f|checkout\s+--\s|push\b[^\r\n]*--force|branch\s+-D)\b|\b(DROP|TRUNCATE)\s+(TABLE|DATABASE|SCHEMA)\b|\bFormat-Volume\b|\bformat\s+[a-z]:' }
+    @{ d = 'NEEDS_APPROVAL'; c = 'git-publish'; rx = '(?i)\bgit\s+(commit|push|merge|rebase|tag|stash|cherry-pick|am)\b' }
+    @{ d = 'NEEDS_APPROVAL'; c = 'dependency-change'; rx = '(?i)\bdotnet\s+(add\s+\S*\s*package|tool\s+install)\b|\b(npm|pnpm)\s+(install|i|add)\s+(?!-)\S|\byarn\s+add\b|\bpip3?\s+install\b|\bpoetry\s+add\b|\b(choco|winget|scoop)\s+install\b|\bInstall-(Module|Package|Script)\b|\bnuget\s+install\b|\bgo\s+get\b|\bmvn\s+[^\r\n]*dependency:get\b' }
+    @{ d = 'NEEDS_APPROVAL'; c = 'database-change'; rx = '(?i)\bdotnet\s+ef\s+(database|migrations\s+remove)\b|\b(alembic|flyway|liquibase)\b|\bmanage\.py\s+migrate\b|\bprisma\s+migrate\b' }
+    @{ d = 'NEEDS_APPROVAL'; c = 'deployment'; rx = '(?i)\b(az|aws|gcloud|kubectl|helm|oc)\s|\bterraform\s+(apply|destroy)\b|\bfunc\s+azure\b|\bdotnet\s+publish\b[^\r\n]*PublishProfile|\bdocker\s+push\b' }
+    @{ d = 'NEEDS_APPROVAL'; c = 'sonar-upload'; rx = '(?i)\b(dotnet-sonarscanner|sonar-scanner|sonarscanner)\b|\bdotnet\s+sonarscanner\b|\bsonar\s+analyze\b' }
+    @{ d = 'NEEDS_APPROVAL'; c = 'network'; rx = '(?i)\b(curl|wget|iwr|irm|Invoke-WebRequest|Invoke-RestMethod)(\.exe)?\b|https?://' }
+)
+foreach ($rule in $CommandRules) { $rule.rx = [regex]::new($rule.rx) }
+
+function Test-CommandLine([string]$line) {
+    $me = [regex]::Escape(($PSCommandPath -replace '\\', '/'))
+    $norm = $line -replace '\\', '/'
+    # The helper itself (the one form the auto-approve rule accepts) is allowed; anything chained to it is checked too.
+    if ($norm -match "^\s*(powershell|pwsh)(\.exe)?\s+-NoProfile\s+-ExecutionPolicy\s+Bypass\s+-File\s+`"?$me`"?\s" -and $line -notmatch '[;&|`$<>]') {
+        return [pscustomobject]@{ decision = 'ALLOW'; category = 'helper'; reason = 'the agent helper' }
+    }
+    foreach ($rule in $CommandRules) { $m = $rule.rx.Match($line); if ($m.Success) { return [pscustomobject]@{ decision = $rule.d; category = $rule.c; reason = "matched '$($m.Value.Trim())'" } } }
+    [pscustomobject]@{ decision = 'ALLOW'; category = 'routine'; reason = 'no rule matched (build, test, read-only, or repository-local command)' }
+}
+
+# Added suppressions and skipped tests on changed lines: gate integrity, checked technically.
+$SuppressionPatterns = [ordered]@{
+    'pragma warning disable' = '#pragma\s+warning\s+disable'; 'SuppressMessage' = '\[(assembly:\s*)?SuppressMessage'; 'NOSONAR' = '(//|#)\s*NOSONAR'
+    'NoWarn' = '<NoWarn>'; 'eslint-disable' = 'eslint-disable'; 'ts-ignore' = '@ts-(ignore|nocheck|expect-error)'; 'SuppressWarnings' = '@SuppressWarnings'
+    'noqa' = '#\s*noqa\b'; 'nosec' = '#\s*nosec\b'; 'type ignore' = '#\s*type:\s*ignore'
+    'skipped test' = '\[(Fact|Theory|Test|TestMethod)\([^)]*Skip\s*=|\[Ignore(\(|\])|\bx(it|describe)\(|\b(it|describe|test)\.skip\(|@pytest\.mark\.skip|@unittest\.skip|@Disabled\b'
+}
+
+function Get-ChangeFindings([string]$root) {   # secrets and suppressions on lines changed against HEAD; values never returned
+    $changed = Get-ChangedLines $root
+    $secrets = New-Object Collections.Generic.List[object]; $supp = New-Object Collections.Generic.List[object]; $lines = 0
+    foreach ($p in $changed.Keys) {
+        $full = Join-Path $root $p
+        try { if ((Get-Item -LiteralPath $full).Length -gt 1MB) { continue }; $bytes = [IO.File]::ReadAllBytes($full) } catch { continue }
+        if ([Array]::IndexOf($bytes, [byte]0) -ge 0) { continue }   # binary
+        $text = [IO.File]::ReadAllLines($full)
+        foreach ($n in $changed[$p]) {
+            if ($n -lt 1 -or $n -gt $text.Length) { continue }
+            $l = $text[$n - 1]; $lines++
+            $k = Find-Secret $l
+            if ($k) { $secrets.Add([pscustomobject]@{ file = $p; line = $n; kind = $k; confidence = $(if ($k -eq 'credential assignment') { 'review' } else { 'high' }) }) }
+            foreach ($s in $SuppressionPatterns.Keys) { if ($l -match $SuppressionPatterns[$s]) { $supp.Add([pscustomobject]@{ file = $p; line = $n; kind = $s }); break } }
+        }
+    }
+    [pscustomobject]@{ files = $changed.Count; lines = $lines; secrets = $secrets.ToArray(); suppressions = $supp.ToArray() }
+}
+
+function Get-DependencyChanges([string]$root) {   # packages added or changed in manifests against HEAD (tracked edits and new files)
+    $rx = '\.(cs|fs|vb)proj$|(^|/)(Directory\.Packages\.props|package\.json|pyproject\.toml|Pipfile|setup\.py|pom\.xml|build\.gradle(\.kts)?|go\.mod|packages\.config)$|(^|/)requirements[^/]*\.txt$'
+    $tracked = @(Invoke-Quiet git -C $root -c core.quotepath=off diff --name-only HEAD | Where-Object { $_ -match $rx })
+    $untracked = @(Invoke-Quiet git -C $root -c core.quotepath=off ls-files -o --exclude-standard | Where-Object { $_ -match $rx })
+    $out = New-Object Collections.Generic.List[string]
+    # Packages named in a manifest: project references, JSON dependency maps, requirement lines and arrays, Maven, Go.
+    $pkg = [regex]::new('(?im)Include="(?<n>[^"]+)"(?:\s+Version="(?<v>[^"]+)")?|"(?<n>@?[\w./-]+)"\s*:\s*"(?<v>[~^<>=]*\d[^"]*)"|^\s*(?<n>[A-Za-z][\w.-]*)\s*(?<v>[=<>~!]=?[^\s;#]+)|"(?<n>[A-Za-z][\w.-]*)\s*(?<v>(?:==|>=|<=|~=|!=)[^"\s,;]*)"|<artifactId>(?<n>[^<]+)</artifactId>|^\s*require\s+(?<n>\S+)\s+(?<v>\S+)|^\s*(?<n>[\w.-]+/[\w./-]+)\s+(?<v>v\d\S*)')
+    $skipNames = '^(name|version|description|main|scripts|private|license|type|node|npm|engines|requires-python)$'
+    $names = { param($text) $set = New-Object 'Collections.Generic.HashSet[string]'; foreach ($m in $pkg.Matches($text)) { $n = $m.Groups['n'].Value; if ($n -notmatch $skipNames) { [void]$set.Add("$n $($m.Groups['v'].Value)".Trim()) } }; $set }
+    # Compared with the same file at HEAD (empty for a new file), so reformatting is not a change and several
+    # packages on one line are each judged on their own.
+    foreach ($f in $tracked + $untracked) {
+        $new = & $names ([IO.File]::ReadAllText((Join-Path $root $f)))
+        $old = if ($untracked -contains $f) { New-Object 'Collections.Generic.HashSet[string]' } else { & $names ((Invoke-Quiet git -C $root -c core.quotepath=off show "HEAD:$f") -join "`n") }
+        foreach ($p in $new) { if (-not $old.Contains($p)) { $out.Add("${f}: $p") } }
+    }
+    @($out | Select-Object -Unique)
+}
+
+function Test-InstalledIntegrity {   # installed files against the SHA-256 install manifest
+    $mf = Join-Path $AkzoHome 'install-manifest.json'
+    if (-not (Test-Path -LiteralPath $mf)) { return [pscustomobject]@{ status = 'NOT VERIFIED'; detail = 'no install manifest (helper runs from the package source, not an installation)' } }
+    $files = @((Get-Content -LiteralPath $mf -Raw | ConvertFrom-Json).files)
+    $bad = @($files | Where-Object { -not (Test-Path -LiteralPath $_.path) -or (Get-FileHash -LiteralPath $_.path -Algorithm SHA256).Hash -ne $_.sha256 } | ForEach-Object { $_.path })
+    $sig = (Get-AuthenticodeSignature -LiteralPath $PSCommandPath).Status
+    if ($bad) { [pscustomobject]@{ status = 'FAIL'; detail = "$($bad.Count) installed file(s) differ from the manifest: $($bad -join ', ')" } }
+    else { [pscustomobject]@{ status = 'PASS'; detail = "$($files.Count) installed file(s) match the SHA-256 manifest ($mf); helper signature: $sig. Hashes prove the files are unchanged since installation, not who produced or approved the package." } }
+}
+
+# The task folder of a work item (for attach/role); throws when it does not exist or is ambiguous.
+function Find-TaskDir([string]$workItem, [string]$repoId) {
+    if ($workItem -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$') { throw "Work-item id '$workItem' must be a folder name such as PBI-12345 (letters, digits, '.', '_', '-')." }
+    if ($repoId -and $repoId -notmatch '^[A-Za-z0-9][A-Za-z0-9._ -]{0,99}$') { throw "Repository id '$repoId' is not a valid id." }
+    $hits = @(Get-ChildItem -LiteralPath $TasksDir -Directory -ErrorAction SilentlyContinue |
+        Where-Object { -not $repoId -or $_.Name -eq $repoId } | ForEach-Object { Join-Path $_.FullName $workItem } |
+        Where-Object { Test-Path -LiteralPath $_ -PathType Container })
+    if ($hits.Count -gt 1) { throw "Work item '$workItem' exists under several repositories ($($hits -join ', ')); add -Repo <id>." }
+    if (-not $hits.Count) { throw "No task folder for '$workItem' under $TasksDir. Start it with intake or task first." }
+    $hits[0]
+}
+
+# pick: choose a requirement document (file dialog unless -Source), convert it, and drop it in the inbox as
+# <inbox>\<name>\refined-pbi.md with the original under source\. The selected file itself is never changed.
+if ($Command -eq 'pick') {
+    if (-not $Source) {
+        if ([Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') { throw 'The file dialog needs an STA thread: run with Windows PowerShell (powershell.exe) or pass -Source.' }
+        Add-Type -AssemblyName System.Windows.Forms
+        $dlg = New-Object Windows.Forms.OpenFileDialog
+        $dlg.Title = 'Akzo Master SDD - select the refined PBI or requirement document'
+        $dlg.Filter = 'Requirement documents (*.md;*.txt;*.docx;*.pdf)|*.md;*.markdown;*.txt;*.docx;*.pdf|All files (*.*)|*.*'
+        $owner = New-Object Windows.Forms.Form -Property @{ TopMost = $true; ShowInTaskbar = $false; Width = 1; Height = 1; StartPosition = 'CenterScreen' }   # keeps the dialog in front of the IDE
+        try {
+            $ok = $dlg.ShowDialog($owner) -eq [Windows.Forms.DialogResult]::OK
+            if ($ok -and -not $Supporting) {   # second, optional dialog: any number of supporting documents (Cancel = none)
+                $more = New-Object Windows.Forms.OpenFileDialog
+                $more.Title = 'Akzo Master SDD - optional: select supporting documents (Cancel = none)'
+                $more.Multiselect = $true
+                $more.InitialDirectory = Split-Path $dlg.FileName
+                $more.Filter = 'All files (*.*)|*.*'
+                if ($more.ShowDialog($owner) -eq [Windows.Forms.DialogResult]::OK) { $Supporting = $more.FileNames -join ';' }
+            }
+        } finally { $owner.Dispose() }
+        if (-not $ok) { [pscustomobject]@{ status = 'CANCELLED'; inbox = $InboxDir } | ConvertTo-Json; exit 0 }
+        $Source = $dlg.FileName
+    }
+    if (-not (Test-Path -LiteralPath $Source -PathType Leaf)) { throw "File not found: $Source" }
+    $pbiItem = (Get-Item -LiteralPath $Source)
+    $text = (ConvertTo-PbiText $pbiItem.FullName).Trim()
+    if (($text -replace '\s', '').Length -lt 40) { throw "'$($pbiItem.Name)' holds almost no text ($($text.Length) characters); choose the refined PBI document." }
+    $name = ($pbiItem.BaseName -replace '[^A-Za-z0-9._ -]', '').Trim()
+    if (-not $name) { $name = 'pbi' }
+    $dest = Join-Path $InboxDir $name
+    for ($n = 2; Test-Path -LiteralPath $dest; $n++) { $dest = Join-Path $InboxDir "$name-$n" }   # a new folder per pick
+    New-Item -ItemType Directory -Force -Path (Join-Path $dest 'source') | Out-Null
+    [IO.File]::WriteAllText((Join-Path $dest 'refined-pbi.md'), $text + "`n", (New-Object Text.UTF8Encoding($false)))
+    Copy-Item -LiteralPath $pbiItem.FullName (Join-Path $dest "source\$($pbiItem.Name)")
+    Add-Content -LiteralPath (Join-Path $dest '.origins.tsv') -Value "source\$($pbiItem.Name)`t$($pbiItem.FullName)" -Encoding UTF8
+    $added = @(foreach ($s in @($Supporting -split ';' | Where-Object { $_.Trim() })) { Copy-Managed $s.Trim() $dest })
+    [pscustomobject]@{ status = 'PICKED'; selected = $pbiItem.FullName; supporting = $added; item = (Get-InboxItem (Get-Item -LiteralPath $dest)); registeredRepos = @(Get-Registry | ForEach-Object { $_.id }) } | ConvertTo-Json -Depth 3
+    exit 0
+}
+
+# intake: copy a refined PBI (file, or folder with notes) into <tasks>\<repo>\<id>\, then continue as 'task'.
+if ($Command -eq 'intake') {
+    if (-not $Source -or -not $Id -or -not $Repo) { throw 'intake needs -Source <file or folder>, -Id <PBI number>, -Repo <repo id>, and -Title "<PBI title>".' }
+    if ($Id -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$') { throw "Work-item id '$Id' must be a folder name such as PBI-12345 (letters, digits, '.', '_', '-')." }
+    if (-not (Get-Registry | Where-Object { $_.id -eq $Repo })) { throw "Repository '$Repo' is not in $Registry. Registered: $((Get-Registry | ForEach-Object { $_.id }) -join ', ')" }
+    $auth = Get-Authorization (Resolve-Repo $Repo)   # preflight before any document is copied for this repository
+    if (Get-PreflightRefusal $auth) { Out-Task (Get-PreflightRefusal $auth) ([ordered]@{ repo = $Repo; id = $Id; authorization = $auth }); exit 0 }
+    if (-not (Test-Path -LiteralPath $Source)) { throw "Source not found: $Source" }
+    $src = Get-Item -LiteralPath $Source
+    $pbiSrc = if ($src.PSIsContainer) { Find-PbiFile $src.FullName } else { $src.FullName }
+    if (-not $pbiSrc) { throw "Cannot tell which file in '$Source' is the refined PBI. Name it refined-pbi.md." }
+    $dest = Join-Path $TasksDir "$Repo\$Id"
+    $destPbi = Join-Path $dest 'refined-pbi.md'
+    if ((Test-Path -LiteralPath $destPbi) -and (Get-FileHash -LiteralPath $destPbi).Hash -ne (Get-FileHash -LiteralPath $pbiSrc).Hash) {
+        throw "Task $Repo\$Id already has a different refined-pbi.md ($destPbi). Edit that file and resume, or use another PBI number."
+    }
+    New-Item -ItemType Directory -Force -Path $dest | Out-Null
+    Copy-Item -LiteralPath $pbiSrc $destPbi -Force
+    $copied = @()
+    if ($src.PSIsContainer) {   # supporting notes come along; existing files in the task are never overwritten
+        foreach ($f in Get-ChildItem -LiteralPath $src.FullName -Recurse -File -Force | Where-Object { $_.FullName -ne $pbiSrc }) {
+            $rel = $f.FullName.Substring($src.FullName.Length + 1)
+            $to = Join-Path $dest $rel
+            if ($rel -eq '.origins.tsv') { Add-Content -LiteralPath $to -Value (Get-Content -LiteralPath $f.FullName -Encoding UTF8) -Encoding UTF8; continue }
+            if (Test-Path -LiteralPath $to) {
+                if ((Get-FileHash -LiteralPath $to).Hash -eq (Get-FileHash -LiteralPath $f.FullName).Hash) { $copied += [pscustomobject]@{ file = $rel; status = 'duplicate' }; continue }
+                $n = 2; do { $to = Join-Path (Split-Path $to) ("{0}-{1}{2}" -f $f.BaseName, $n++, $f.Extension) } while (Test-Path -LiteralPath $to)
+                $copied += [pscustomobject]@{ file = $to.Substring($dest.Length + 1); status = 'renamed' }
+            }
+            New-Item -ItemType Directory -Force -Path (Split-Path $to) | Out-Null; Copy-Item -LiteralPath $f.FullName $to
+        }
+    }
+    if ($Title -and -not $Feature) { $Feature = Get-FeatureName $Title }
+    $Command = 'task'
+}
+
+# attach: add supporting documents to an existing task (managed copies), then report as 'task'.
+$attached = $null
+if ($Command -eq 'attach') {
+    if (-not $Id -or -not $Source) { throw 'attach needs -Id <PBI number> and -Source "<file>[;<file>...]".' }
+    $dir = Find-TaskDir $Id $Repo
+    $auth = Get-Authorization (Resolve-Repo (Split-Path (Split-Path $dir) -Leaf))   # preflight before documents are copied
+    if (Get-PreflightRefusal $auth) { Out-Task (Get-PreflightRefusal $auth) ([ordered]@{ repo = $auth.repo; id = $Id; authorization = $auth }); exit 0 }
+    $attached = @(foreach ($s in @($Source -split ';' | Where-Object { $_.Trim() })) { Copy-Managed $s.Trim() $dir })
+    $Repo = Split-Path (Split-Path $dir) -Leaf
+    $Command = 'task'
+}
+
+# role: the developer corrects the role guessed for one input; kept on later runs.
+if ($Command -eq 'role') {
+    if (-not $Id -or -not $File -or -not $Role) { throw "role needs -Id <PBI>, -File <input path as listed>, and -Role <$($InputRoles -join '|')>." }
+    if ($Role -notin $InputRoles) { throw "Unknown role '$Role'. Use one of: $($InputRoles -join ', ')." }
+    $dir = Find-TaskDir $Id $Repo
+    $m = Sync-InputManifest $dir
+    $hit = @($m.entries | Where-Object { $_.file -eq $File -or $_.originalName -eq $File })
+    if ($hit.Count -ne 1) { throw "Input '$File' matches $($hit.Count) entries in $($m.path); use the path shown in the input index." }
+    $hit[0].role = $Role; $hit[0].roleSetBy = 'user'
+    [IO.File]::WriteAllText($m.path, ([pscustomobject]@{ workItem = $Id; files = @($m.entries) } | ConvertTo-Json -Depth 4), $Utf8NoBom)
+    $hit[0] | Select-Object file, role, roleSetBy | ConvertTo-Json
+    exit 0
+}
+
+# discover: rebuild a repository's architecture index now (normally refreshed automatically when HEAD moves).
+if ($Command -eq 'discover') {
+    $rr = Resolve-Repo $Repo
+    $null = Assert-Preflight $rr
+    Sync-Architecture $rr -Force | ConvertTo-Json
+    exit 0
+}
+
+# policy: the preflight for one repository (no repository content is read).
+if ($Command -eq 'policy') {
+    $r = Resolve-Repo $Repo
+    $a = Get-Authorization $r
+    $a | Add-Member -NotePropertyName preflight -NotePropertyValue $(if (Get-PreflightRefusal $a) { Get-PreflightRefusal $a } else { 'OK' })
+    $a | Add-Member -NotePropertyName note -NotePropertyValue 'AUTHORIZED comes from a policy file; ATTESTED is the developer''s recorded statement. Neither is verified corporate approval unless the policy is administrator-managed (managed: true).'
+    $a | ConvertTo-Json -Depth 3
+    exit 0
+}
+
+# authorize: record the developer's statement that processing this repository is authorized (with the reference they hold).
+if ($Command -eq 'authorize') {
+    $r = Resolve-Repo $Repo
+    $ref = ("$Reference" -replace '\s+', ' ').Trim()
+    if ($ref.Length -lt 3 -or $ref.Length -gt 200) { throw '-Reference must name the authorization you hold (3 to 200 characters), e.g. a ticket, policy, or approver.' }
+    if (Find-Secret $ref) { throw 'Refused: the reference looks like it contains a secret.' }
+    if ($Classification -notin $Classifications) { throw "-Classification must be one of: $($Classifications -join ', ')." }
+    $hostList = @("$Hosts" -split ';' | ForEach-Object { $_.Trim().ToLowerInvariant() } | Where-Object { $_ })
+    foreach ($h in $hostList) { if ($h -notmatch '^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$') { throw "Host '$h' must be a host name such as sonarqube.example.com." } }
+    $all = Read-Authorizations
+    $entry = [pscustomobject][ordered]@{ reference = $ref; classification = $Classification; model = "$Model"; allowedHosts = $hostList; recordedBy = "$env:USERDOMAIN\$env:USERNAME"; recordedAt = (Get-Date).ToString('s'); kind = 'developer statement' }
+    $all.repos | Add-Member -NotePropertyName $r.id -NotePropertyValue $entry -Force
+    New-Item -ItemType Directory -Force -Path $AkzoHome | Out-Null
+    Write-TextAtomic $AuthFile ($all | ConvertTo-Json -Depth 5)
+    $a = Get-Authorization $r
+    [pscustomobject][ordered]@{ status = $a.status; repo = $r.id; reference = $ref; classification = $Classification; reason = $a.reason
+        note = 'Recorded as your statement with your user name. It lets the agent work on this repository; it is not corporate approval (G8 reports it as NOT VERIFIED).' } | ConvertTo-Json -Depth 3
+    exit 0
+}
+
+# guard: classify a terminal command before the agent runs it; logged to the task's evidence when -Id is given.
+if ($Command -eq 'guard') {
+    $cmdText = (@($Line) + @($Rest) | Where-Object { $_ }) -join ' '
+    if (-not $cmdText) { throw 'guard needs -Line "<command line>" (use single quotes inside the command, not double quotes).' }
+    $Line = $cmdText
+    $g = Test-CommandLine $Line
+    if ($g.decision -eq 'NEEDS_APPROVAL' -and $ApprovedBy) { $g.decision = 'APPROVED'; $g.reason += "; approved by $ApprovedBy" }
+    if ($g.decision -eq 'BLOCK' -and $ApprovedBy) { $g.reason += '; an approval cannot release a blocked command (it needs a policy change through the authorized process)' }
+    if ($Id) {
+        $td = Find-TaskDir $Id $Repo
+        $log = Join-Path $td 'evidence\commands.tsv'
+        New-Item -ItemType Directory -Force -Path (Split-Path $log) | Out-Null
+        [IO.File]::AppendAllText($log, "$((Get-Date).ToString('s'))`t$($g.decision)`t$($g.category)`t$ApprovedBy`t$(Protect-Text ($Line -replace '[\t\r\n]+', ' '))`r`n", $Utf8NoBom)
+    }
+    [pscustomobject][ordered]@{ decision = $g.decision; category = $g.category; reason = (Protect-Text $g.reason) } | ConvertTo-Json
+    exit 0
+}
+
+# scan: secrets and added suppressions on changed lines, and dependency changes (values are never shown).
+if ($Command -eq 'scan') {
+    $r = Resolve-Repo $Repo
+    $null = Assert-Preflight $r
+    $f = Get-ChangeFindings $r.path
+    [pscustomobject][ordered]@{ repo = $r.id; changedFiles = $f.files; changedLines = $f.lines; secrets = $f.secrets; suppressions = $f.suppressions; dependencyChanges = @(Get-DependencyChanges $r.path)
+        note = 'Pattern scan of changed lines: it cannot find every secret; review findings marked review, and use an approved dedicated scanner where the organization provides one.' } | ConvertTo-Json -Depth 4
+    exit 0
+}
+
+# purge: delete a repository's memory (index, symbols, facts, notes, graph); -IncludeTasks also deletes its task folders.
+if ($Command -eq 'purge') {
+    if (-not $Repo) { throw 'purge needs -Repo <id>.' }
+    if (-not $Confirmed) { throw "purge deletes the memory of '$Repo' and cannot be undone: ask the developer, then rerun with -Confirmed." }
+    if ($Repo -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$') { throw "Repository id '$Repo' is not a valid id." }
+    $gone = @()
+    foreach ($p in @((Join-Path $AkzoHome "maps\$Repo"), (Join-Path $AkzoHome "maps\$Repo.md"), (Join-Path $AkzoHome "graphs\$Repo")) + @(if ($IncludeTasks) { Join-Path $TasksDir $Repo })) {
+        if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Recurse -Force; $gone += $p }
+    }
+    [pscustomobject]@{ status = 'PURGED'; repo = $Repo; removed = $gone } | ConvertTo-Json
+    exit 0
+}
+
+# security: the G8 corporate security gate for one task. Deterministic evidence only; writes
+# <task>\evidence\corporate-security-report.html (never into the repository). PASS only when every control has evidence.
+if ($Command -eq 'security') {
+    if (-not $Id) { throw 'security needs -Id <PBI> (add -Repo when the PBI exists under several repositories).' }
+    $td = Find-TaskDir $Id $Repo
+    $r = Resolve-Repo (Split-Path (Split-Path $td) -Leaf)
+    $auth = Get-Authorization $r
+    $st = try { Get-Content -LiteralPath (Join-Path $td 'task.json') -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $null }
+    $head = "$(Invoke-Quiet git -C $r.path rev-parse HEAD)"
+    $mapsDir = Join-Path $AkzoHome "maps\$($r.id)"
+    $controls = New-Object Collections.Generic.List[object]
+    $add = { param($name, $status, $evidence) $controls.Add([pscustomobject][ordered]@{ control = $name; status = $status; evidence = (Protect-Text "$evidence") }) }
+    $cmdLog = Join-Path $td 'evidence\commands.tsv'
+    $cmds = @(if (Test-Path -LiteralPath $cmdLog) { Get-Content -LiteralPath $cmdLog -Encoding UTF8 | ForEach-Object { $c = $_.Split("`t"); [pscustomobject]@{ at = $c[0]; decision = $c[1]; category = $c[2]; approvedBy = $c[3]; command = $c[4] } } })
+    $netLog = @(if (Test-Path -LiteralPath (Join-Path $mapsDir 'memory-log.tsv')) { Get-Content -LiteralPath (Join-Path $mapsDir 'memory-log.tsv') -Encoding UTF8 | Where-Object { $_ -match "`tnetwork`t" } | ForEach-Object { ($_ -split "`t")[2] } })
+    $netHosts = @($netLog | ForEach-Object { ($_ -split ' ')[1] } | Where-Object { $_ } | Select-Object -Unique)
+
+    # 1. Approved repository and model
+    $who = if ($auth.status -eq 'ATTESTED') { "developer statement '$($auth.reference)' by $($auth.recordedBy) on $($auth.recordedAt)" } else { "policy $($auth.source) (reference '$($auth.policyReference)', repository '$($auth.reference)')" }
+    if ($auth.status -notin 'AUTHORIZED', 'ATTESTED') { & $add 'Approved repository and model' 'FAIL' "processing is not authorized: $($auth.reason)" }
+    elseif ($auth.status -eq 'ATTESTED') { & $add 'Approved repository and model' 'NOT VERIFIED' "$who; a developer statement is not corporate approval$(if ($auth.model) { "; model stated: $($auth.model)" })" }
+    elseif (-not $auth.managed) { & $add 'Approved repository and model' 'NOT VERIFIED' "$who; the policy file is writable by the current user, so it cannot show administrator approval" }
+    elseif (-not $auth.approvedModels.Count) { & $add 'Approved repository and model' 'NOT VERIFIED' "$who; the policy names no approved models" }
+    elseif (-not $auth.model) { & $add 'Approved repository and model' 'NOT VERIFIED' "$who; the model in use was not confirmed (authorize -Model)" }
+    else { & $add 'Approved repository and model' 'PASS' "$who; model '$($auth.model)' confirmed by the developer is in approvedModels" }
+
+    # 2. Source-code handling
+    $inRepo = Get-GitTop $td
+    $factsFile = Join-Path $mapsDir 'facts.json'
+    $hasFacts = (Test-Path -LiteralPath $factsFile) -and @((Get-Content -LiteralPath $factsFile -Raw | ConvertFrom-Json).facts).Count
+    $flow = "PBI and documents in $td$(if ($inRepo) { ' (INSIDE a Git repository)' } else { ' (outside the repository)' }); memory in $mapsDir; classification: $($auth.classification); content reaches the model only through Copilot in the IDE"
+    if ($inRepo -or ($auth.memory -eq 'disabled' -and $hasFacts)) { & $add 'Source-code handling' 'FAIL' "$flow$(if ($auth.memory -eq 'disabled' -and $hasFacts) { '; facts stored although the policy disables memory' })" }
+    elseif ($auth.classification -eq 'unclassified') { & $add 'Source-code handling' 'NOT VERIFIED' "$flow; no data classification recorded, so the permitted boundaries are unknown" }
+    else { & $add 'Source-code handling' 'PASS' $flow }
+
+    # 3. DLP compliance (recorded commands and the helper's own network calls)
+    $badHosts = @($netHosts | Where-Object { $auth.allowedHosts -notcontains $_ })
+    $transfer = @($cmds | Where-Object { $_.category -in 'external-transfer', 'remote-code-execution', 'credential-access' })
+    if ($transfer.Count -or $badHosts.Count) { & $add 'DLP compliance' 'FAIL' "$(if ($transfer.Count) { "$($transfer.Count) transfer/execution/credential command(s) requested: $(@($transfer | ForEach-Object { $_.command }) -join ' | ')" }) $(if ($badHosts.Count) { "helper called hosts outside the allowlist: $($badHosts -join ', ')" })" }
+    elseif (-not $cmds.Count) { & $add 'DLP compliance' 'NOT VERIFIED' "no command log ($cmdLog): the agent recorded no guard checks; helper network calls: $(if ($netHosts.Count) { $netHosts -join ', ' } else { 'none' })" }
+    else { & $add 'DLP compliance' 'PASS' "$($cmds.Count) command(s) checked by the guard, none transfers data; helper network calls only to allowed hosts: $(if ($netHosts.Count) { $netHosts -join ', ' } else { 'none' })" }
+
+    # 4. Secret scanning and 13. suppressions (changed lines)
+    $find = Get-ChangeFindings $r.path
+    $high = @($find.secrets | Where-Object { $_.confidence -eq 'high' }); $review = @($find.secrets | Where-Object { $_.confidence -eq 'review' })
+    $where = { param($list) @($list | ForEach-Object { "$($_.file):$($_.line) ($($_.kind))" }) -join ', ' }
+    if ($high.Count) { & $add 'Secret scanning' 'FAIL' "built-in pattern scan of $($find.lines) changed line(s): $($high.Count) likely secret(s) at $(& $where $high)" }
+    elseif ($review.Count) { & $add 'Secret scanning' 'NOT VERIFIED' "built-in pattern scan: $($review.Count) finding(s) to review at $(& $where $review)" }
+    else { & $add 'Secret scanning' 'PASS' "built-in pattern scan of $($find.lines) changed line(s) in $($find.files) file(s): 0 findings (pattern scanning cannot prove that no secret exists)" }
+
+    # 5. Dependency security
+    $deps = @(Get-DependencyChanges $r.path)
+    if (-not $deps.Count) { & $add 'Dependency security' 'NOT APPLICABLE' 'no dependency added or changed in any manifest against HEAD' }
+    else { & $add 'Dependency security' 'NOT VERIFIED' "dependency changes need approval and an approved vulnerability and licence check: $($deps -join '; ')" }
+
+    # 6. SonarQube (read-only; only to an allowed host)
+    $s = Get-SonarSetup $r
+    $sonar = ''
+    if (-not $s.serverQueries) { & $add 'SonarQube' 'NOT VERIFIED' "not configured (project key '$($s.projectKey)', server '$($s.host)', token set: $($s.tokenSet))" }
+    elseif ($auth.allowedHosts -notcontains (Get-HostName $s.host)) { & $add 'SonarQube' 'NOT VERIFIED' "server $(Get-HostName $s.host) is not an allowed host for this repository" }
+    elseif (Get-HostIssue $s.host) { & $add 'SonarQube' 'NOT VERIFIED' "no request made: $(Get-HostIssue $s.host)" }
+    else {
+        try {
+            $g = (Invoke-SonarApi $s.host "api/qualitygates/project_status?projectKey=$([Uri]::EscapeDataString($s.projectKey))").projectStatus
+            $an = try { @((Invoke-SonarApi $s.host "api/project_analyses/search?project=$([Uri]::EscapeDataString($s.projectKey))&ps=1").analyses)[0] } catch { $null }
+            Add-MemoryLog $r.id 'network' "GET $(Get-HostName $s.host) api/qualitygates/project_status (G8)"
+            $dirty = @(Invoke-Quiet git -C $r.path status --porcelain).Count
+            $sonar = "quality gate $($g.status); analysis $($an.key) at revision $($an.revision); failing: $(@($g.conditions | Where-Object { $_.status -eq 'ERROR' } | ForEach-Object { $_.metricKey }) -join ', ')"
+            if ($g.status -eq 'ERROR') { & $add 'SonarQube' 'FAIL' $sonar }
+            elseif ($an.revision -eq $head -and -not $dirty) { & $add 'SonarQube' 'PASS' $sonar }
+            else { & $add 'SonarQube' 'NOT VERIFIED' "$sonar; the analysis does not contain this task's changes (HEAD $head, $dirty changed path(s))" }
+        } catch { & $add 'SonarQube' 'NOT VERIFIED' "server query failed: $($_.Exception.Message)" }
+    }
+
+    # 7. Script safety
+    $blocked = @($cmds | Where-Object { $_.decision -eq 'BLOCK' })
+    if ($blocked.Count) { & $add 'Script safety' 'FAIL' "$($blocked.Count) prohibited command(s) were requested: $(@($blocked | ForEach-Object { "$($_.category): $($_.command)" }) -join ' | ')" }
+    elseif (-not $cmds.Count) { & $add 'Script safety' 'NOT VERIFIED' 'no command log: commands were not checked by the guard' }
+    else { & $add 'Script safety' 'PASS' "$(@($cmds | Group-Object decision | ForEach-Object { "$($_.Name) $($_.Count)" }) -join ', '); approvals: $(@($cmds | Where-Object { $_.decision -eq 'APPROVED' } | ForEach-Object { "$($_.category) by $($_.approvedBy)" }) -join ', ')" }
+
+    # 8. Repository isolation
+    $foreign = @(if ($hasFacts) { (Get-Content -LiteralPath $factsFile -Raw | ConvertFrom-Json).facts | Where-Object { $_.repo -and $_.repo -ne $r.id } })
+    if ($foreign.Count) { & $add 'Repository isolation' 'FAIL' "$($foreign.Count) fact(s) of another repository in $factsFile" }
+    else { & $add 'Repository isolation' 'PASS' "memory for '$($r.id)' only in $mapsDir; facts carry this repository id; cross-repository isolation is covered by scripts\test.ps1 (memory isolation checks)" }
+
+    # 9. Memory security
+    $memSecrets = @(foreach ($f in @($factsFile, (Join-Path $mapsDir 'memory-log.tsv'), (Join-Path $AkzoHome "maps\$($r.id).md"))) { if ((Test-Path -LiteralPath $f) -and (Find-Secret ([IO.File]::ReadAllText($f)))) { $f } })
+    $prot = @(@($mapsDir, (Join-Path $TasksDir $r.id)) | Where-Object { (Test-Path -LiteralPath $_) -and -not (Test-ProtectedDirectory $_) })
+    $ret = if ($auth.retentionDays) { "retention $($auth.retentionDays) days (policy)" } else { 'no retention rule supplied by a policy' }
+    if ($memSecrets.Count) { & $add 'Memory security' 'FAIL' "secret-looking values in: $($memSecrets -join ', ')" }
+    elseif ($prot.Count) { & $add 'Memory security' 'NOT VERIFIED' "not restricted to the owner, SYSTEM, and Administrators: $($prot -join ', '); $ret" }
+    else { & $add 'Memory security' 'PASS' "owner-only access on $mapsDir and the task folders; no secret-looking values in facts, log, or notes; facts hold statements and file references, no source bodies; $ret; purge: akzo.ps1 purge -Repo $($r.id) -Confirmed" }
+
+    # 10. Installer integrity
+    $ii = Test-InstalledIntegrity
+    & $add 'Installer integrity' $ii.status $ii.detail
+
+    # 11. Git operations
+    if (-not $st.startHead) { & $add 'Git operations' 'NOT VERIFIED' 'task start HEAD not recorded (task created before 3.4.0); pushes cannot be detected locally' }
+    elseif ($st.startHead -eq $head) { & $add 'Git operations' 'PASS' "HEAD unchanged since the task started ($head): no commit was made; changes stay uncommitted for review. Pushes cannot be detected locally; the agent never pushes (S18)." }
+    else { $n = @(Invoke-Quiet git -C $r.path rev-list "$($st.startHead)..$head").Count; & $add 'Git operations' 'NOT VERIFIED' "HEAD moved from $($st.startHead) to $head ($n commit(s)); the agent does not commit, so confirm they were made by the developer" }
+
+    # 12. Corporate policy approval
+    if ($auth.status -eq 'AUTHORIZED' -and $auth.managed -and $auth.policyReference -and $auth.reference) { & $add 'Corporate policy approval' 'PASS' "administrator-managed policy $($auth.source) (reference '$($auth.policyReference)') authorizes '$($r.id)' (reference '$($auth.reference)'). Automated checks are not a substitute for this approval." }
+    else { & $add 'Corporate policy approval' 'NOT VERIFIED' "no administrator-managed policy authorizes '$($r.id)' ($(if ($auth.status -eq 'ATTESTED') { 'developer statement only' } elseif ($auth.status -eq 'AUTHORIZED') { 'policy file is not administrator-managed, or lacks references' } else { $auth.reason })). Request approval through the authorized process." }
+
+    # 13. Suppressions and skipped tests added by the change
+    if ($find.suppressions.Count) { & $add 'Findings not suppressed' 'FAIL' "suppressions or skipped tests added: $(& $where $find.suppressions)" }
+    else { & $add 'Findings not suppressed' 'PASS' "no suppression, analyzer exclusion, or skipped test added on $($find.lines) changed line(s)" }
+
+    $all = $controls.ToArray()
+    $outcome = if (@($all | Where-Object { $_.status -eq 'FAIL' }).Count) { 'FAIL' } elseif (@($all | Where-Object { $_.status -eq 'NOT VERIFIED' }).Count) { 'NOT VERIFIED' } else { 'PASS' }
+    $report = Join-Path $td 'evidence\corporate-security-report.html'
+    New-Item -ItemType Directory -Force -Path (Split-Path $report) | Out-Null
+    $e = { param($v) [Net.WebUtility]::HtmlEncode((Protect-Text "$v")) }
+    $cls = @{ 'PASS' = 'p'; 'FAIL' = 'f'; 'NOT VERIFIED' = 'n'; 'NOT APPLICABLE' = 'a' }
+    $rows = ($all | ForEach-Object { "<tr><td>$(& $e $_.control)</td><td><span class=""s $($cls[$_.status])"">$(& $e $_.status)</span></td><td>$(& $e $_.evidence)</td></tr>" }) -join "`n"
+    $cmdRows = if ($cmds.Count) { ($cmds | ForEach-Object { "<tr><td>$(& $e $_.at)</td><td>$(& $e $_.decision)</td><td>$(& $e $_.category)</td><td><code>$(& $e $_.command)</code></td></tr>" }) -join "`n" } else { '<tr><td colspan="4">No commands recorded by the guard.</td></tr>' }
+    $list = { param($items) if (@($items).Count) { '<ul>' + ((@($items) | ForEach-Object { "<li>$(& $e $_)</li>" }) -join '') + '</ul>' } else { '<p>None.</p>' } }
+    $nv = @($all | Where-Object { $_.status -eq 'NOT VERIFIED' }); $fails = @($all | Where-Object { $_.status -eq 'FAIL' })
+    $remed = @(foreach ($c in $fails) { "$($c.control): fix the finding, then rerun the gate." }) + @(foreach ($c in $nv) {
+            switch ($c.control) {
+                'Approved repository and model' { 'Have an administrator list the repository and approved models in the machine policy, and confirm the model in use (authorize -Model).' }
+                'Corporate policy approval' { 'Request authorization through the organization''s approval process; an administrator records it in the machine policy.' }
+                'SonarQube' { 'Run the approved Sonar analysis for this change (with the developer''s approval), then rerun the gate.' }
+                'Secret scanning' { 'Review each finding; run the organization''s approved secret scanner.' }
+                'Dependency security' { 'Approve each dependency change and run the approved vulnerability and licence check.' }
+                default { "$($c.control): provide the missing evidence, then rerun the gate." }
+            } })
+    $html = @"
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Corporate security report</title>
+<style>:root{--bg:#f6f7f9;--fg:#1c2430;--mut:#5a6473;--line:#d9dee6;--p:#1e7b46;--f:#b42318;--n:#9a5b00;--a:#5a6473}
+@media(prefers-color-scheme:dark){:root{--bg:#12161c;--fg:#e5e9ef;--mut:#9aa4b2;--line:#2c3440;--p:#5cc28a;--f:#f07a6e;--n:#e0a84a;--a:#9aa4b2}}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 "Segoe UI",system-ui,sans-serif}main{max-width:1000px;margin:0 auto;padding:24px 16px}
+h1{font-size:1.5rem;margin:0 0 4px}h2{font-size:1.1rem;margin:24px 0 8px}table{border-collapse:collapse;width:100%;font-size:.9rem}th,td{border-bottom:1px solid var(--line);padding:6px 8px;text-align:left;vertical-align:top}
+.s{font-weight:700;white-space:nowrap}.p{color:var(--p)}.f{color:var(--f)}.n{color:var(--n)}.a{color:var(--a)}.mut{color:var(--mut)}code{font:.85em Consolas,monospace;word-break:break-all}.wrap{overflow-x:auto}</style></head><body><main>
+<h1>Corporate security report (G8)</h1><p class="mut">Akzo SDD Agent — Developed and maintained by Arun RG</p>
+<p><b>Outcome: <span class="s $($cls[$outcome])">$outcome</span></b>. Automated verification is not formal corporate approval. PASS means every control below had evidence; it does not certify compliance.</p>
+<h2>1. Agent and repository</h2><p>Agent $(& $e $Version) · repository <code>$(& $e $r.id)</code> ($(& $e $r.path)) · work item <code>$(& $e $Id)</code> · HEAD <code>$(& $e $head)</code></p>
+<h2>2. Date and environment</h2><p>$(& $e (Get-Date).ToString('yyyy-MM-dd HH:mm:ss zzz')) · $(& $e "$env:COMPUTERNAME / $env:USERDOMAIN\$env:USERNAME") · Windows PowerShell $(& $e $PSVersionTable.PSVersion) · $(& $e ((Invoke-Quiet git --version) -join ''))</p>
+<h2>3. Policy sources and authorization</h2><p>Status <b>$(& $e $auth.status)</b> · source $(& $e $(if ($auth.source) { $auth.source } else { 'none' })) · administrator-managed: $(& $e $auth.managed) · policy reference $(& $e $auth.policyReference) · repository reference $(& $e $auth.reference) $(if ($auth.reason) { '· ' + (& $e $auth.reason) })</p>
+<h2>4. Data classification and processing boundaries</h2><p>Classification <b>$(& $e $auth.classification)</b> · memory $(& $e $auth.memory) · retention $(& $e $(if ($auth.retentionDays) { "$($auth.retentionDays) days" } else { 'not set' })) · allowed hosts $(& $e $(if ($auth.allowedHosts.Count) { $auth.allowedHosts -join ', ' } else { 'none' })) · approved models $(& $e $(if ($auth.approvedModels.Count) { $auth.approvedModels -join ', ' } else { 'not set' })) · model stated $(& $e $(if ($auth.model) { $auth.model } else { 'not confirmed' }))</p>
+<h2>5. Commands and external tools</h2><div class="wrap"><table><thead><tr><th>Time</th><th>Decision</th><th>Category</th><th>Command (redacted)</th></tr></thead><tbody>$cmdRows</tbody></table></div><p>Helper network calls: $(& $e $(if ($netLog.Count) { $netLog -join '; ' } else { 'none' }))</p>
+<h2>6. Dependency changes</h2>$(& $list $deps)
+<h2>7. Secret scanning</h2><p>Changed lines scanned: $($find.lines) in $($find.files) file(s). Values are never shown.</p>$(& $list @($find.secrets | ForEach-Object { "$($_.file):$($_.line) - $($_.kind) ($($_.confidence))" }))
+<h2>8. Static analysis and SonarQube</h2><p>$(& $e $(if ($sonar) { $sonar } else { ($all | Where-Object { $_.control -eq 'SonarQube' }).evidence }))</p><p class="mut">Build, analyzer, and coverage results of this task are in the plan (sections 4 and 6): $(& $e $(if ($st.specDir) { Join-Path $st.specDir 'plan.md' } else { 'plan.md' })).</p>
+<h2>9. Memory storage and isolation</h2><p>$(& $e (($all | Where-Object { $_.control -in 'Repository isolation', 'Memory security' } | ForEach-Object { "$($_.control): $($_.evidence)" }) -join ' · '))</p>
+<h2>10. Detected violations and unresolved risks</h2>$(& $list @($fails | ForEach-Object { "$($_.control): $($_.evidence)" }))
+<h2>11. Controls not verified</h2>$(& $list @($nv | ForEach-Object { "$($_.control): $($_.evidence)" }))
+<h2>12. Remediation</h2>$(& $list $remed)
+<h2>13. G8 controls and outcome</h2><div class="wrap"><table><thead><tr><th>Control</th><th>Status</th><th>Evidence</th></tr></thead><tbody>$rows</tbody></table></div>
+<p><b>Final G8 outcome: <span class="s $($cls[$outcome])">$outcome</span></b></p></main></body></html>
+"@
+    [IO.File]::WriteAllText($report, $html, $Utf8NoBom)
+    Add-MemoryLog $r.id 'g8' "$Id $outcome"
+    [pscustomobject][ordered]@{
+        gate = 'G8'; outcome = $outcome; status = $(if ($outcome -eq 'FAIL') { 'BLOCKED' } elseif ($outcome -eq 'NOT VERIFIED') { 'DONE_WITH_CONCERNS' } else { 'READY_FOR_HANDOVER' })
+        report = $report; controls = $all; notVerified = @($nv | ForEach-Object { $_.control }); violations = @($fails | ForEach-Object { $_.control })
+        note = 'Automated verification is not formal corporate approval.'
+    } | ConvertTo-Json -Depth 4
+    exit 0
+}
+
+# remember: store or re-verify one fact with its evidence (repo-relative files that exist now; their content is fingerprinted).
+if ($Command -eq 'remember') {
+    $r = Resolve-Repo $Repo
+    $auth = Assert-Preflight $r
+    if ($auth.memory -eq 'disabled') { throw "Refused: the policy disables repository memory for '$($r.id)'." }
+    if ($Type -notin $FactTypes) { throw "-Type must be one of: $($FactTypes -join ', ')." }
+    $t = ("$Text" -replace '\s+', ' ').Trim()
+    if ($t.Length -lt 10 -or $t.Length -gt 800) { throw '-Text must be one factual statement of 10 to 800 characters.' }
+    $secret = Find-Secret "$t $Evidence"
+    if ($secret) { throw "Refused: the fact looks like it contains a secret ($secret). Record where the value is configured, never the value." }
+    if (Find-InstructionText $t) { throw 'Refused: the fact reads like an instruction to the agent. Memory holds verified statements about the code, never instructions.' }
+    $blobs = Get-FileBlobs $r.path
+    $ev = @(foreach ($e in @("$Evidence" -split ';' | Where-Object { $_.Trim() })) {
+            if ($e.Trim() -notmatch '^(?<p>[^:*?"<>|]+?)(?::(?<l>\d+))?$') { throw "Evidence '$e' must be <repo-relative path>[:line]." }
+            $p = $Matches['p'].Trim() -replace '\\', '/'
+            if ([IO.Path]::IsPathRooted($p) -or $p -match '(^|/)\.\.(/|$)') { throw "Evidence '$p' must be a path inside the repository." }
+            if (-not $blobs.ContainsKey($p)) { throw "Evidence '$p' is not a file of the repository (tracked or untracked, not ignored)." }
+            [pscustomobject][ordered]@{ path = $p; line = $(if ($Matches['l']) { [int]$Matches['l'] } else { $null }); blob = $blobs[$p] } })
+    if (-not $ev.Count) { throw '-Evidence needs at least one "path:line": a fact without evidence is not stored.' }
+    $file = Join-Path $AkzoHome "maps\$($r.id)\facts.json"
+    New-Item -ItemType Directory -Force -Path (Split-Path $file) | Out-Null
+    $load = Read-JsonOrRecover $file
+    $facts = New-Object Collections.Generic.List[object]; foreach ($f in @($load.data.facts | Where-Object { $_ })) { $facts.Add($f) }
+    $deps = @("$DependsOn" -split ';' | Where-Object { $_.Trim() } | ForEach-Object { $_.Trim() })
+    foreach ($d in $deps) { if (-not ($facts | Where-Object { $_.id -eq $d })) { throw "Unknown fact '$d' in -DependsOn." } }
+    $fid = if ($Id) { $Id } else { 'F-' + (Get-TextHash "$Type|$($t.ToLowerInvariant())").Substring(0, 8) }   # same statement -> same id (no duplicates)
+    if ($fid -notmatch '^F-[0-9a-f]{8}$') { throw "Fact id '$fid' must look like F-1a2b3c4d." }
+    $hit = $facts | Where-Object { $_.id -eq $fid } | Select-Object -First 1
+    if ($Id -and -not $hit) { throw "Unknown fact '$Id'." }
+    $now = (Get-Date).ToString('s')
+    $fact = [pscustomobject][ordered]@{
+        id = $fid; type = $Type; repo = $r.id; text = $t; evidence = $ev; dependsOn = $deps; status = 'verified'; reason = ''
+        createdAt = $(if ($hit) { $hit.createdAt } else { $now }); verifiedAt = $now; verifiedCommit = "$(Invoke-Quiet git -C $r.path rev-parse HEAD)"; source = "$Pbi"; checkedAt = $now
+        invalidatedBy = 'a change to or removal of any evidence file, or an unverified fact in dependsOn'
+    }
+    if ($hit) { $facts.Remove($hit) | Out-Null }
+    $facts.Add($fact)
+    Write-TextAtomic $file ([pscustomobject]@{ schemaVersion = 1; repo = $r.id; facts = $facts.ToArray() } | ConvertTo-Json -Depth 5)   # 5.1: @(List) breaks ConvertTo-Json
+    Add-MemoryLog $r.id $(if ($hit) { 'reverify' } else { 'store' }) "$fid $Type"
+    [pscustomobject][ordered]@{ status = $(if ($hit) { 'UPDATED' } else { 'STORED' }); id = $fid; type = $Type; evidence = @($ev | ForEach-Object { "$($_.path):$($_.line)" }); recovered = $load.recovered } | ConvertTo-Json -Depth 3
+    exit 0
+}
+
+# forget: retire a fact that is no longer true (kept in facts-expired.json with the reason).
+if ($Command -eq 'forget') {
+    $r = Resolve-Repo $Repo
+    $file = Join-Path $AkzoHome "maps\$($r.id)\facts.json"
+    $facts = @((Read-JsonOrRecover $file).data.facts | Where-Object { $_ })
+    $hit = $facts | Where-Object { $_.id -eq $Id } | Select-Object -First 1
+    if (-not $hit) { throw "Unknown fact '$Id'." }
+    $hit | Add-Member -NotePropertyName expiredAt -NotePropertyValue (Get-Date).ToString('s') -Force
+    $hit | Add-Member -NotePropertyName reason -NotePropertyValue $(if ($Text) { "forgotten: $Text" } else { 'forgotten' }) -Force
+    $ef = Join-Path (Split-Path $file) 'facts-expired.json'
+    $old = @((Read-JsonOrRecover $ef).data.facts | Where-Object { $_ })
+    Write-TextAtomic $ef ([pscustomobject]@{ schemaVersion = 1; repo = $r.id; facts = @($old + $hit) } | ConvertTo-Json -Depth 5)
+    Write-TextAtomic $file ([pscustomobject]@{ schemaVersion = 1; repo = $r.id; facts = @($facts | Where-Object { $_.id -ne $Id }) } | ConvertTo-Json -Depth 5)
+    Add-MemoryLog $r.id 'forget' "$Id $Text"
+    [pscustomobject]@{ status = 'FORGOTTEN'; id = $Id } | ConvertTo-Json
+    exit 0
+}
+
+# context: deterministic, budgeted retrieval for a requirement: verified facts, then ranked files with their symbols,
+# tests, references, and siblings. Ranking: term matches in file name (3), folder (1), symbols (1.5 each, max 3 per term),
+# scaled by term coverage; core component roles +1; references from other files +0.4 each (max 10); tests ranked lower
+# and listed under their subject. Paths beyond the budget are still named in 'more', so nothing is hidden silently.
+if ($Command -eq 'context') {
+    $r = Resolve-Repo $Repo
+    if (-not $Query) { throw 'context needs -Query "<requirement terms>".' }
+    $auth = Assert-Preflight $r
+    $sync = Sync-Architecture $r
+    $facts = Sync-Facts $r $script:LastBlobs $auth.retentionDays
+    $cfgR = if ($r.cfg.retrieval) { $r.cfg.retrieval } else { $Config.retrieval }
+    $m = if ($Mode) { $Mode } elseif ($cfgR.mode -in 'compact', 'balanced', 'deep') { $cfgR.mode } else { 'balanced' }
+    $budget = if ($cfgR.budgets.$m -as [int]) { [int]$cfgR.budgets.$m } else { @{ compact = 2500; balanced = 7000; deep = 20000 }[$m] }
+    $perFile = @{ compact = 6; balanced = 12; deep = 40 }[$m]
+    $refChecks = @{ compact = 6; balanced = 12; deep = 25 }[$m]
+    $terms = @(Get-Tokens $Query)
+    if (-not $terms.Count) { throw "No usable search terms in '$Query'." }
+    $roles = @{}; foreach ($l in [IO.File]::ReadAllLines($sync.componentIndex)) { $c = $l.Split("`t"); if ($c.Count -eq 2) { $roles[$c[1]] = $c[0] } }
+    $syms = @{}
+    foreach ($l in [IO.File]::ReadAllLines($sync.symbols)) {
+        $c = $l.Split("`t"); if ($c.Count -lt 5) { continue }
+        if (-not $syms.ContainsKey($c[0])) { $syms[$c[0]] = New-Object Collections.Generic.List[object] }
+        if ($c[2] -ne '0') { $syms[$c[0]].Add([pscustomobject]@{ line = [int]$c[2]; kind = $c[3]; name = $c[4]; lname = $c[4].ToLowerInvariant() }) }
+    }
+    $tokMemo = @{}
+    $symHas = { param($sy, $t) if (-not $sy.lname.Contains($t)) { return $false }; if (-not $tokMemo.ContainsKey($sy.name)) { $tokMemo[$sy.name] = @(Get-Tokens $sy.name) }; $tokMemo[$sy.name] -contains $t }
+    $subjectOf = { param($p) $leaf = $p.Substring($p.LastIndexOf('/') + 1).ToLowerInvariant(); $leaf = $leaf -replace '\.(spec|test)\.[a-z]+$', '' -replace '\.[a-z0-9]+$', ''; ($leaf -replace '^test_', '' -replace '_test$', '' -replace '(tests?|spec|it)$', '') }
+    $testsBySubject = @{}
+    foreach ($p in $roles.Keys) { if ($roles[$p] -eq 'test') { $k = & $subjectOf $p; if (-not $testsBySubject.ContainsKey($k)) { $testsBySubject[$k] = New-Object Collections.Generic.List[string] }; $testsBySubject[$k].Add($p) } }
+    $core = 'endpoint', 'command', 'query', 'handler', 'validator', 'service', 'repository', 'model', 'mapping', 'ui', 'ui-service', 'graphql', 'contract', 'schema'
+    $scored = New-Object Collections.Generic.List[object]
+    foreach ($p in @(@($syms.Keys) + @($roles.Keys) | Select-Object -Unique)) {
+        $slash = $p.LastIndexOf('/')
+        $fileTok = @(Get-Tokens $p.Substring($slash + 1)); $dirTok = if ($slash -gt 0) { @(Get-Tokens $p.Substring(0, $slash)) } else { @() }
+        $s = 0.0; $matched = New-Object Collections.Generic.List[string]
+        $fs = if ($syms.ContainsKey($p)) { $syms[$p] } else { @() }
+        foreach ($t in $terms) {
+            $hit = $false
+            if ($fileTok -contains $t) { $s += 3; $hit = $true } elseif ($dirTok -contains $t) { $s += 1; $hit = $true }
+            $n = 0; foreach ($sy in $fs) { if ($sy.kind -ne 'import' -and (& $symHas $sy $t)) { $n++; if ($n -ge 3) { break } } }
+            if ($n) { $s += 1.5 * $n; $hit = $true }
+            if ($hit) { $matched.Add($t) }
+        }
+        if (-not $matched.Count) { continue }
+        $s *= 1 + $matched.Count / $terms.Count
+        $role = $roles[$p]
+        if ($role -in $core) { $s += 1 }
+        if ($role -eq 'test') { $s *= 0.6 }
+        $scored.Add([pscustomobject]@{ path = $p; role = $role; score = $s; matched = @($matched); refs = $null })
+    }
+    # References: how many other files name the file's main type (git grep, only for the top candidates).
+    $top = @($scored | Sort-Object @{ e = { $_.score }; Descending = $true }, path | Select-Object -First $refChecks)
+    foreach ($c in $top) {
+        if ($c.role -eq 'test') { continue }
+        $main = @($syms[$c.path] | Where-Object { $_.kind -eq 'type' } | Select-Object -First 1).name
+        if (-not $main) { $leaf = $c.path.Substring($c.path.LastIndexOf('/') + 1); $main = $leaf.Split('.')[0] }
+        if ($main.Length -lt 4) { continue }
+        $n = @(Invoke-Quiet git -C $r.path grep -l -w -F -e $main -- . ":(exclude)$($c.path)").Count
+        $c.refs = $n; $c.score += [math]::Min($n, 10) * 0.4
+    }
+    $ranked = @($scored | Sort-Object @{ e = { $_.score }; Descending = $true }, path)
+    $out = [ordered]@{ repo = $r.id; mode = $m; budgetChars = $budget; terms = $terms; memory = $sync.memory; facts = @(); files = @(); more = @(); usedChars = 0
+        note = 'Ranked by deterministic matching, not proof: read the cited lines before classifying a requirement; use -Mode deep or targeted search when nothing fits.' }
+    $used = 0
+    foreach ($f in @($facts.all | Where-Object { $_.status -ne 'invalid' })) {   # facts first: they carry verified knowledge
+        $ft = @(Get-Tokens $f.text); $paths = @($f.evidence | ForEach-Object { $_.path })
+        $hitT = @($terms | Where-Object { $ft -contains $_ }).Count
+        if ($hitT -lt [math]::Min(2, $terms.Count) -and -not @($ranked | Select-Object -First 5 | Where-Object { $paths -contains $_.path }).Count) { continue }
+        $row = [pscustomobject][ordered]@{ id = $f.id; type = $f.type; status = $f.status; text = $f.text; evidence = (@($f.evidence | ForEach-Object { "$($_.path):$($_.line)" }) -join ', ') }
+        $len = ($row | ConvertTo-Json -Compress).Length
+        if ($used + $len -gt $budget * 0.4) { break }   # facts take at most 40% so files are always shown
+        $out.facts += $row; $used += $len
+    }
+    $i = 0
+    foreach ($c in $ranked) {
+        $i++
+        if ($c.role -eq 'test' -and @($ranked | Select-Object -First 10 | Where-Object { (& $subjectOf $_.path) -eq (& $subjectOf $c.path) -and $_.role -ne 'test' }).Count) { continue }   # shown under its subject
+        $fs = if ($syms.ContainsKey($c.path)) { @($syms[$c.path] | Where-Object { $_.kind -ne 'import' }) } else { @() }
+        $seen = @{}; $pick = New-Object Collections.Generic.List[object]   # matching symbols first, then types and routes, then the rest
+        foreach ($sy in @(@($fs | Where-Object { $sy2 = $_; @($terms | Where-Object { & $symHas $sy2 $_ }).Count }) + @($fs | Where-Object { $_.kind -in 'type', 'route' }) + $fs)) {
+            $k = "$($sy.line)|$($sy.name)"
+            if (-not $seen.ContainsKey($k)) { $seen[$k] = 1; $pick.Add($sy); if ($pick.Count -ge $perFile) { break } }
+        }
+        $dir = if ($c.path.LastIndexOf('/') -gt 0) { $c.path.Substring(0, $c.path.LastIndexOf('/')) } else { '' }
+        $sib = @(if ($i -le 3) { $roles.Keys | Where-Object { $_ -ne $c.path -and $_.StartsWith("$dir/") -and $_.Substring($dir.Length + 1) -notmatch '/' } | Sort-Object | Select-Object -First 6 })
+        $row = [pscustomobject][ordered]@{
+            path = $c.path; role = $c.role; score = [math]::Round($c.score, 1); matched = ($c.matched -join ',')
+            symbols = @($pick | Sort-Object line | ForEach-Object { "L$($_.line) $($_.kind) $($_.name)" })
+            tests = @($testsBySubject[(& $subjectOf $c.path)] | Where-Object { $_ -and $_ -ne $c.path })
+            refs = $c.refs
+            siblings = $sib
+        }
+        $len = ($row | ConvertTo-Json -Compress).Length
+        if ($used + $len -gt $budget -and $out.files.Count) { $out.more += $c.path; if ($out.more.Count -ge 20) { break }; continue }
+        $out.files += $row; $used += $len
+    }
+    $out.usedChars = $used
+    Add-MemoryLog $r.id 'context' "$m '$($terms -join ' ')' files $($out.files.Count) facts $($out.facts.Count)"
+    [pscustomobject]$out | ConvertTo-Json -Depth 4 -Compress
+    exit 0
+}
+
+# sonar: the repository's Sonar setup, or one read-only server query (-Check). Never uploads an analysis.
+if ($Command -eq 'sonar') {
+    $r = Resolve-Repo $Repo
+    $auth = Assert-Preflight $r
+    $s = Get-SonarSetup $r
+    if (-not $Check) { $s | ConvertTo-Json -Depth 3; exit 0 }
+    # Values go into a URL: validate them first.
+    if ($Branch -and $PullRequest) { throw 'Give -Branch or -PullRequest, not both.' }
+    if ($Branch -and $Branch -notmatch '^[A-Za-z0-9_./-]{1,200}$') { throw "Branch '$Branch' has characters a Sonar branch name cannot have." }
+    if ($PullRequest -and $PullRequest -notmatch '^\d{1,10}$') { throw "Pull request '$PullRequest' must be a number." }
+    if ($Key -and $Key -notmatch '^[\w.-]+:[\w.-]+$') { throw "Rule key '$Key' must look like csharpsquid:S3776." }
+    $out = [ordered]@{ check = $Check; repo = $r.id; projectKey = $s.projectKey; host = $s.host; branch = $Branch; pullRequest = $PullRequest }
+    if (-not $s.serverQueries) {
+        $missing = @(); if (-not $s.projectKey) { $missing += 'project key (sonar-project.properties or pipeline)' }
+        if (-not $s.host) { $missing += 'server URL (SONAR_HOST_URL or sonar.host.url)' }; if (-not $s.tokenSet) { $missing += 'token in the SONAR_TOKEN environment variable' }
+        $out.status = 'NO_SERVER'; $out.missing = $missing
+        [pscustomobject]$out | ConvertTo-Json -Depth 3; exit 0
+    }
+    $hostName = Get-HostName $s.host
+    if ($auth.allowedHosts -notcontains $hostName) {   # no network call to a host the policy or authorization does not allow
+        $out.status = 'HOST_NOT_ALLOWED'; $out.reason = "'$hostName' is not an allowed host for '$($r.id)'. An administrator lists it in the policy (allowedHosts), or the developer records it: authorize -Repo $($r.id) -Reference ""<approval>"" -Classification <c> -Hosts ""$hostName""."
+        [pscustomobject]$out | ConvertTo-Json -Depth 3; exit 0
+    }
+    $hostIssue = Get-HostIssue $s.host
+    if ($hostIssue) { $out.status = 'INSECURE_HOST'; $out.reason = "No request was made: $hostIssue."; [pscustomobject]$out | ConvertTo-Json -Depth 3; exit 0 }
+    Add-MemoryLog $r.id 'network' "GET $hostName $Check"
+    $k = $s.projectKey
+    if ($k -notmatch '^[\w.:-]+$') { throw "Project key '$k' has unexpected characters." }
+    $esc = { param($v) [Uri]::EscapeDataString($v) }
+    $ctx = if ($Branch) { "&branch=$(& $esc $Branch)" } elseif ($PullRequest) { "&pullRequest=$PullRequest" } else { '' }
+    $paths = @("$File" -split ';' | Where-Object { $_.Trim() } | ForEach-Object { $_.Trim() -replace '\\', '/' })
+    $rel = { param($component) if ($component -like "${k}:*") { $component.Substring($k.Length + 1) } else { $component } }
+    try {
+        switch ($Check) {
+            'gate' {
+                $g = (Invoke-SonarApi $s.host "api/qualitygates/project_status?projectKey=$(& $esc $k)$ctx").projectStatus
+                $out.gate = $g.status
+                $out.conditions = @($g.conditions | Sort-Object { $_.status -ne 'ERROR' } | ForEach-Object { [pscustomobject][ordered]@{ metric = $_.metricKey; status = $_.status; comparator = $_.comparator; threshold = $_.errorThreshold; actual = $_.actualValue } })
+                # Which commit the gate describes: older than HEAD means local changes are not in it.
+                try {
+                    $a = @((Invoke-SonarApi $s.host "api/project_analyses/search?project=$(& $esc $k)&ps=1$ctx").analyses)[0]
+                    if ($a) {
+                        $headSha = "$(Invoke-Quiet git -C $r.path rev-parse HEAD)"
+                        $out.analysis = [pscustomobject][ordered]@{ key = $a.key; date = $a.date; revision = $a.revision; behindHead = [bool]($a.revision -and $a.revision -ne $headSha) }
+                    }
+                } catch { $out.analysis = 'not available' }
+            }
+            'issues' {
+                $comp = if ($paths) { ($paths | ForEach-Object { "${k}:$_" }) -join ',' } else { $k }
+                $res = Invoke-SonarApi $s.host "api/issues/search?componentKeys=$(& $esc $comp)&resolved=false&ps=100$(if ($NewCode) { '&inNewCodePeriod=true' })$ctx"
+                $out.total = $res.total
+                $out.issues = @($res.issues | ForEach-Object {
+                        [pscustomobject][ordered]@{ file = (& $rel $_.component); line = $_.line; severity = $_.severity; impacts = (@($_.impacts | ForEach-Object { "$($_.softwareQuality):$($_.severity)" }) -join ' '); rule = $_.rule; message = $_.message } })
+            }
+            'hotspots' {
+                $res = Invoke-SonarApi $s.host "api/hotspots/search?projectKey=$(& $esc $k)&status=TO_REVIEW&ps=100$(if ($NewCode) { '&inNewCodePeriod=true' })$(if ($paths) { '&files=' + (& $esc ($paths -join ',')) })$ctx"
+                $out.total = $res.paging.total
+                $out.hotspots = @($res.hotspots | ForEach-Object { [pscustomobject][ordered]@{ file = (& $rel $_.component); line = $_.line; probability = $_.vulnerabilityProbability; category = $_.securityCategory; rule = $_.ruleKey; message = $_.message } })
+            }
+            'coverage' {
+                if ($paths) {
+                    $out.files = @(foreach ($p in $paths) {
+                            $fk = & $esc "${k}:$p"
+                            $m = (Invoke-SonarApi $s.host "api/measures/component?component=$fk&metricKeys=coverage,line_coverage,branch_coverage,new_coverage$ctx").component.measures
+                            $lines = @((Invoke-SonarApi $s.host "api/sources/lines?key=$fk$ctx").sources)
+                            [pscustomobject][ordered]@{
+                                file = $p; measures = (@($m | ForEach-Object { "$($_.metric)=$(if ($null -ne $_.value) { $_.value } else { $_.period.value })" }) -join ' ')
+                                uncovered = (Join-Ranges @($lines | Where-Object { $null -ne $_.lineHits -and $_.lineHits -eq 0 } | ForEach-Object { $_.line }))
+                                partialBranches = (Join-Ranges @($lines | Where-Object { $_.conditions -and $_.coveredConditions -lt $_.conditions } | ForEach-Object { $_.line }))
+                            } })
+                } else {
+                    $res = Invoke-SonarApi $s.host "api/measures/component_tree?component=$(& $esc $k)&metricKeys=coverage,uncovered_lines&qualifiers=FIL&strategy=leaves&s=metric&metricSort=coverage&asc=true&ps=20$ctx"
+                    $out.worstFiles = @($res.components | ForEach-Object { [pscustomobject][ordered]@{ file = (& $rel $_.key); measures = (@($_.measures | ForEach-Object { "$($_.metric)=$($_.value)" }) -join ' ') } })
+                }
+            }
+            'duplication' {
+                if ($paths) {
+                    $out.files = @(foreach ($p in $paths) {
+                            $d = Invoke-SonarApi $s.host "api/duplications/show?key=$(& $esc "${k}:$p")$ctx"
+                            $names = @{}; foreach ($f in $d.files.PSObject.Properties) { $names[$f.Name] = (& $rel $f.Value.key) }
+                            [pscustomobject][ordered]@{ file = $p; blocks = @($d.duplications | ForEach-Object { (@($_.blocks | ForEach-Object { "$($names[$_._ref]):$($_.from)-$($_.from + $_.size - 1)" }) -join ' = ') }) } })
+                } else {
+                    $res = Invoke-SonarApi $s.host "api/measures/component_tree?component=$(& $esc $k)&metricKeys=duplicated_lines_density,duplicated_lines,duplicated_blocks&qualifiers=FIL&strategy=leaves&s=metric&metricSort=duplicated_lines&asc=false&ps=20$ctx"
+                    $out.worstFiles = @($res.components | Where-Object { @($_.measures | Where-Object { [double]$_.value -gt 0 }).Count } | ForEach-Object { [pscustomobject][ordered]@{ file = (& $rel $_.key); measures = (@($_.measures | ForEach-Object { "$($_.metric)=$($_.value)" }) -join ' ') } })
+                }
+            }
+            'rule' {
+                if (-not $Key) { throw 'sonar -Check rule needs -Key <rule key>, e.g. csharpsquid:S3776.' }
+                $rule = (Invoke-SonarApi $s.host "api/rules/show?key=$(& $esc $Key)").rule
+                $html = if ($rule.htmlDesc) { $rule.htmlDesc } else { (@($rule.descriptionSections | ForEach-Object { $_.content }) -join "`n") }
+                $desc = [Net.WebUtility]::HtmlDecode(($html -replace '<[^>]+>', ' ' -replace '\s+', ' ')).Trim()
+                $out.rule = [pscustomobject][ordered]@{ key = $rule.key; name = $rule.name; severity = $rule.severity; type = $rule.type; language = $rule.langName; description = $(if ($desc.Length -gt 2000) { $desc.Substring(0, 2000) + '...' } else { $desc }) }
+            }
+        }
+        $out.status = 'OK'
+        $out.note = 'Server data is the last analysis uploaded for this branch or pull request, not uncommitted local changes.'
+    } catch {
+        $code = try { [int]$_.Exception.Response.StatusCode } catch { 0 }
+        $out.status = 'SONAR_ERROR'; $out.httpStatus = $code; $out.error = $_.Exception.Message
+    }
+    [pscustomobject]$out | ConvertTo-Json -Depth 4
+    exit 0
+}
+
+# coverage: coverage of the lines changed against HEAD, from Cobertura or LCOV reports (the repo's own coverage tool).
+if ($Command -eq 'coverage') {
+    $r = Resolve-Repo $Repo
+    $null = Assert-Preflight $r
+    $reports = @("$Report" -split ';' | Where-Object { $_.Trim() } | ForEach-Object { $_.Trim() })
+    if (-not $reports) { throw 'coverage needs -Report "<cobertura.xml or lcov.info>[;<more>]".' }
+    foreach ($f in $reports) { if (-not (Test-Path -LiteralPath $f -PathType Leaf)) { throw "Coverage report not found: $f" } }
+    $data = @{}
+    foreach ($f in $reports) { $one = Read-CoverageReport $f $r.path; foreach ($k in $one.Keys) { $data[$k] = $one[$k] } }
+    $changed = Get-ChangedLines $r.path
+    $rootN = ($r.path -replace '\\', '/').ToLowerInvariant().TrimEnd('/')
+    $rows = @(); $notInReport = @(); $totCov = 0; $totHit = 0
+    foreach ($p in ($changed.Keys | Sort-Object)) {
+        $pn = $p.ToLowerInvariant()
+        $hit = $data.Keys | Where-Object { $_ -eq "$rootN/$pn" -or $_.EndsWith("/$pn") -or $_ -eq $pn } | Select-Object -First 1
+        if (-not $hit) { $notInReport += $p; continue }
+        $e = $data[$hit]
+        $coverable = @($changed[$p] | Where-Object { $e.hits.ContainsKey($_) })
+        $uncovered = @($coverable | Where-Object { $e.hits[$_] -eq 0 })
+        $totCov += $coverable.Count; $totHit += $coverable.Count - $uncovered.Count
+        $rows += [pscustomobject][ordered]@{
+            file = $p; changedLines = $changed[$p].Count; coverable = $coverable.Count; covered = $coverable.Count - $uncovered.Count
+            percent = $(if ($coverable.Count) { [math]::Round(100 * ($coverable.Count - $uncovered.Count) / $coverable.Count, 1) } else { $null })
+            uncovered = (Join-Ranges $uncovered); partialBranches = (Join-Ranges @($changed[$p] | Where-Object { $e.partial.ContainsKey($_) }))
+        }
+    }
+    [pscustomobject][ordered]@{
+        repo = $r.id; reports = $reports; changedFiles = $changed.Count
+        coverableChangedLines = $totCov; coveredChangedLines = $totHit
+        percent = $(if ($totCov) { [math]::Round(100 * $totHit / $totCov, 1) } else { $null })
+        files = $rows; notInReport = $notInReport
+    } | ConvertTo-Json -Depth 3
+    exit 0
+}
+
+switch ($Command) {
+    'inbox' {
+        New-Item -ItemType Directory -Force -Path $InboxDir | Out-Null
+        $items = foreach ($i in Get-ChildItem -LiteralPath $InboxDir | Sort-Object LastWriteTime -Descending) { Get-InboxItem $i }
+        [pscustomobject]@{ inbox = $InboxDir; items = @($items); registeredRepos = @(Get-Registry | ForEach-Object { $_.id }) } | ConvertTo-Json -Depth 3
+    }
+    'home' {
+        [pscustomobject]@{
+            version = $Version; inbox = $InboxDir
+            home = $AkzoHome; registry = $Registry; registryExists = (Test-Path $Registry); modules = $ModulesDir
+            tasks = $TasksDir; maps = Join-Path $AkzoHome 'maps'; graphs = Join-Path $AkzoHome 'graphs'
+        } | ConvertTo-Json
+    }
+    'registry' {
+        if (-not (Test-Path $Registry)) { throw "No registry at $Registry. Run the Akzo-Agent installer or copy config\repos.example.json there." }
+        Get-Registry | ForEach-Object {
+            $exists = Test-Dir $_.path
+            [pscustomobject]@{
+                id = $_.id; path = $_.path; exists = $exists
+                git = [bool]($exists -and (Test-Path (Join-Path $_.path '.git')))
+                purpose = $_.purpose; commands = $_.commands; verified = $_.verified.date
+            }
+        } | ConvertTo-Json -Depth 4
+    }
+    'state' {
+        $r = Resolve-Repo $Repo
+        [pscustomobject]@{
+            id = $r.id; path = $r.path; registered = $r.registered
+            branch = (Invoke-Quiet git -C $r.path rev-parse --abbrev-ref HEAD)
+            head = (Invoke-Quiet git -C $r.path rev-parse HEAD)
+            changes = @(git -C $r.path status --porcelain=v1)
+        } | ConvertTo-Json
+    }
+    'task' {
+        $ids = @(Get-Registry | ForEach-Object { $_.id })
+        $info = [ordered]@{ tasksDir = $TasksDir; registeredRepos = $ids }
+        $dir = $null
+        if ($Path) {
+            if ((Split-Path $Path -Leaf) -ne 'refined-pbi.md') { throw "The requirement file must be named refined-pbi.md (got '$Path')." }
+            if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "File not found: $Path" }
+            $dir = Split-Path (Resolve-Path -LiteralPath $Path).Path
+            if (-not $Id) { $Id = Split-Path $dir -Leaf }
+            if (-not $Repo -and (Split-Path (Split-Path $dir)) -eq $TasksDir) { $Repo = Split-Path (Split-Path $dir) -Leaf }
+        }
+        if ($Id -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$') { throw "Work-item id '$Id' must be a folder name such as PBI-12345 (letters, digits, '.', '_', '-')." }
+        $info.id = $Id
+        if (-not $dir) {
+            $hits = @(Get-ChildItem -LiteralPath $TasksDir -Directory -ErrorAction SilentlyContinue |
+                Where-Object { -not $Repo -or $_.Name -eq $Repo } | ForEach-Object { Join-Path $_.FullName $Id } |
+                Where-Object { Test-Path -LiteralPath $_ -PathType Container })
+            if ($hits.Count -gt 1) { $info.candidates = $hits; return Out-Task 'AMBIGUOUS' $info }
+            if ($hits.Count) { $dir = $hits[0]; $Repo = Split-Path (Split-Path $dir) -Leaf }
+            else {
+                # "Implement PBI <id>": a PBI waiting in the inbox is offered for intake, with the open workspace as the repository.
+                $queued = @(Get-ChildItem -LiteralPath $InboxDir -ErrorAction SilentlyContinue | ForEach-Object { Get-InboxItem $_ } |
+                    Where-Object { $_.suggestedId -eq $Id -or $_.name -match "(^|[^0-9A-Za-z])$([regex]::Escape($Id))([^0-9A-Za-z]|$)" })
+                $info.suggestedRepo = $(if ($Repo) { $Repo } else { Get-WorkspaceRepo })
+                if ($queued.Count) { $info.items = $queued; return Out-Task 'IN_INBOX' $info }
+                if (-not $Repo) { $info.expected = Join-Path $TasksDir "<repo-id>\$Id\refined-pbi.md"; return Out-Task 'NOT_FOUND' $info }
+            }
+        }
+        if (-not $Repo) { $info.taskDir = $dir; $info.suggestedRepo = Get-WorkspaceRepo; return Out-Task 'NEEDS_REPO' $info }
+        if ($Repo -notin $ids) { $info.repo = $Repo; return Out-Task 'UNKNOWN_REPO' $info }
+        $r = Resolve-Repo $Repo
+        # G8 preflight: no indexing, document extraction, or content output before processing is authorized.
+        $auth = Get-Authorization $r
+        $info.authorization = [pscustomobject][ordered]@{ status = $auth.status; source = $auth.source; managed = $auth.managed; reference = $auth.reference; classification = $auth.classification; memory = $auth.memory; allowedHosts = $auth.allowedHosts; reason = $auth.reason }
+        if (Get-PreflightRefusal $auth) {
+            $info.repo = $r.id
+            $info.authorize = "authorize -Repo $($r.id) -Reference ""<the approval you hold>"" -Classification <public|internal|confidential> [-Model ""<model in use>""] [-Hosts ""<sonar host>""]"
+            return Out-Task (Get-PreflightRefusal $auth) $info
+        }
+        if (-not $dir) { $dir = Join-Path $TasksDir "$($r.id)\$Id" }
+        $top = Get-GitTop $dir
+        if ($top) { throw "Task folder '$dir' is inside the Git repository '$top' and would show in Git Changes. Use $TasksDir\<repo-id>\$Id\ instead." }
+        $info.repo = $r.id; $info.repoPath = $r.path; $info.taskDir = $dir
+        $pbi = Join-Path $dir 'refined-pbi.md'
+        $info.refinedPbi = $pbi
+
+        # Spec location: remembered in task.json once chosen, so resume never needs the original flags.
+        $stateFile = Join-Path $dir 'task.json'
+        $saved = if (Test-Path -LiteralPath $stateFile) { Get-Content -LiteralPath $stateFile -Raw -Encoding UTF8 | ConvertFrom-Json } else { $null }
+        if ($saved.specDir) { $artifacts = $saved.specDir }
+        else {
+            $specsDir = if ($r.cfg.specsDir) { $r.cfg.specsDir -replace '/', '\' } elseif ($RepoMode) { 'specs' } else { '' }
+            if ($r.cfg.specsDir -and -not $Feature) {   # repo convention: specs are named by feature, not PBI
+                $info.specsDir = Join-Path $r.path $specsDir
+                if (Test-Path -LiteralPath $pbi) { return Out-Task 'NEEDS_FEATURE' $info }
+            }
+            if ($Feature -and $Feature -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$') { throw "Feature folder '$Feature' must be a folder name (letters, digits, '.', '_', '-')." }
+            $artifacts = if ($specsDir) { Join-Path $r.path (Join-Path $specsDir $(if ($Feature) { $Feature } else { $Id })) } else { $dir }
+        }
+        $evidence = Join-Path $dir 'evidence'
+        New-Item -ItemType Directory -Force -Path $dir, $evidence | Out-Null
+        $created = @()
+        if (Test-Path -LiteralPath $pbi) {   # spec/plan only once there is a requirement to work from
+            New-Item -ItemType Directory -Force -Path $artifacts | Out-Null
+            foreach ($t in 'spec', 'plan') {
+                $dest = Join-Path $artifacts "$t.md"
+                if (-not (Test-Path -LiteralPath $dest)) { Copy-Item (Join-Path $ModulesDir "$t\assets\$t.md") $dest; $created += $dest }   # never overwrite work
+            }
+            if (-not $saved) { [pscustomobject]@{ repo = $r.id; id = $Id; title = $Title; specDir = $artifacts; agentVersion = $Version; startHead = "$(Invoke-Quiet git -C $r.path rev-parse HEAD)"; startedAt = (Get-Date).ToString('s') } | ConvertTo-Json | Set-Content -LiteralPath $stateFile -Encoding UTF8 }
+        }
+        $base = Join-Path $dir 'refined-pbi.baseline.md'
+        if ($Baseline) {
+            if (-not (Test-Path -LiteralPath $pbi)) { throw "No $pbi to record as baseline." }
+            Copy-Item -LiteralPath $pbi $base -Force
+        }
+        $pbiState = if (-not (Test-Path -LiteralPath $pbi)) { 'missing' }
+            elseif (-not (Test-Path -LiteralPath $base)) { 'new' }
+            elseif ((Get-FileHash -LiteralPath $pbi).Hash -eq (Get-FileHash -LiteralPath $base).Hash) { 'unchanged' }
+            else { 'changed' }
+        if ($pbiState -eq 'missing') { return Out-Task 'NO_REFINED_PBI' $info }
+        $plan = Join-Path $artifacts 'plan.md'
+        $statusOf = { param($f) $l = (Select-String -LiteralPath $f -Pattern '^Status:' -ErrorAction SilentlyContinue | Select-Object -First 1).Line; if ($l -and $l -notmatch '\|') { ($l -replace '^Status:\s*').Trim() } else { 'not started' } }
+        $manifest = Sync-InputManifest $dir
+        $info.inputs = @($manifest.entries | ForEach-Object { Join-Path $dir $_.file })
+        # Compact index only (no document text). 'read' (relative to taskDir) appears only when it is not the file
+        # itself, i.e. the cached text of a converted document; headings are a short preview for choosing sections.
+        $info.inputIndex = @($manifest.entries | ForEach-Object {
+                $row = [ordered]@{ file = $_.file; role = $_.role; kind = $_.kind; kb = $_.kb; status = $_.status }
+                if ($_.read -and $_.read -ne (Join-Path $dir $_.file)) { $row.read = $_.read.Substring($dir.Length + 1) }
+                if ($_.headings) { $h = (@($_.headings -split '; ') | Select-Object -First 5) -join '; '; $row.headings = $(if ($h.Length -gt 120) { $h.Substring(0, 120) } else { $h }) }
+                [pscustomobject]$row })
+        $info.inputIssues = @($manifest.issues)
+        $info.inputsChanged = @($manifest.changed)
+        $info.inputManifest = $manifest.path
+        if ($null -ne $copied) { $info.copied = @($copied) }
+        if ($null -ne $attached) { $info.attached = @($attached) }
+        $info.title = $(if ($saved.title) { $saved.title } else { $Title })
+        $info.agentVersion = $Version
+        $info.mode = $(if ($artifacts -eq $dir) { 'external' } else { 'repo' })
+        $info.pbiState = $pbiState; $info.baseline = $base
+        $info.spec = Join-Path $artifacts 'spec.md'; $info.plan = $plan
+        $info.specStatus = & $statusOf $info.spec
+        $info.planStatus = & $statusOf $plan
+        $gapLine = (Select-String -LiteralPath $info.spec -Pattern '^Gap map:' -ErrorAction SilentlyContinue | Select-Object -First 1).Line
+        $info.gapMapStatus = $(if ($gapLine -and $gapLine -notmatch '\|') { ($gapLine -replace '^Gap map:\s*').Trim() } else { 'not started' })
+        $info.evidence = $evidence; $info.created = $created
+        $info.git = [ordered]@{
+            branch = (Invoke-Quiet git -C $r.path rev-parse --abbrev-ref HEAD); head = (Invoke-Quiet git -C $r.path rev-parse HEAD)
+            changes = @(git -C $r.path status --porcelain=v1)
+        }
+        $info.repoGuidance = @(Get-RepoGuidance $r.path)
+        $map = Join-Path $AkzoHome "maps\$($r.id).md"
+        $info.mapPath = $map
+        $info.map = $(if (Test-Path -LiteralPath $map) { Protect-Text (Get-Content -LiteralPath $map -Raw -Encoding UTF8) } else { '' })
+        $info.architecture = Sync-Architecture $r -Head "$($info.git.head)"   # HEAD already read above: no extra git call
+        $facts = Sync-Facts $r $script:LastBlobs $auth.retentionDays
+        Protect-Directory (Join-Path $TasksDir $r.id) | Out-Null
+        # Verified memory first (compact rows, ~4 KB); the rest is reachable through 'context'.
+        $rows = New-Object Collections.Generic.List[string]; $size = 0
+        foreach ($f in @($facts.all | Where-Object { $_.status -eq 'verified' } | Sort-Object { [array]::IndexOf($FactTypes, $_.type) }, id)) {
+            $row = "$($f.id) [$($f.type)] $($f.text) ($(@($f.evidence | ForEach-Object { "$($_.path):$($_.line)" }) -join ', '))"
+            if ($size + $row.Length -gt 4000) { break }
+            $rows.Add($row); $size += $row.Length
+        }
+        $info.memory = [pscustomobject][ordered]@{
+            facts = $facts.path; verified = $facts.verified; stale = $facts.stale; expired = $facts.expired; recovered = $facts.recovered
+            staleFacts = $facts.staleFacts; verifiedFacts = @($rows); omitted = $facts.verified - $rows.Count
+        }
+        $info.pbiFlag = Find-InstructionText ([IO.File]::ReadAllText($pbi))
+        $info.graph = $(if (Test-Path -LiteralPath (Join-Path $AkzoHome "graphs\$($r.id)\graph.json")) { 'available' } else { 'none' })
+        $info.sonar = Get-SonarSetup $r -Brief
+        Out-Task 'READY' $info
+    }
+    'graph' {
+        if (-not $Update -and -not $Query) { throw 'graph needs -Update and/or -Query.' }
+        $r = Resolve-Repo $Repo
+        $out = Join-Path $AkzoHome "graphs\$($r.id)"
+        $graph = Join-Path $out 'graph.json'
+        $headFile = Join-Path $out 'akzo-head.txt'
+        $head = Invoke-Quiet git -C $r.path rev-parse HEAD
+        # A missing python leaves $LASTEXITCODE from the git call above, so check the command first.
+        $hasPython = [bool](Get-Command python -ErrorAction SilentlyContinue)
+        if ($hasPython) { Invoke-Quiet python -c "import graphify" | Out-Null }
+        if (-not $hasPython -or $LASTEXITCODE -ne 0) { Write-Output 'GRAPHIFY_UNAVAILABLE: use targeted search instead.'; exit 0 }
+        if ($Update) {
+            New-Item -ItemType Directory -Force -Path $out | Out-Null
+            $env:GRAPHIFY_OUT = $out   # absolute path: graphify writes here instead of <repo>\graphify-out
+            python -m graphify update $r.path
+            if ($LASTEXITCODE -ne 0) { throw "graphify update failed ($LASTEXITCODE)." }
+            Set-Content -Path $headFile -Value $head -Encoding ascii
+        }
+        if ($Query) {
+            if (-not (Test-Path $graph)) { Write-Output "NO_GRAPH: run 'graph -Repo $($r.id) -Update' or use targeted search."; exit 0 }
+            $built = if (Test-Path $headFile) { (Get-Content $headFile -Raw).Trim() } else { '' }
+            $dirty = @(git -C $r.path status --porcelain=v1 --untracked-files=no).Count
+            if ($built -ne $head -or $dirty -gt 0) {
+                Write-Output "STALE_GRAPH: built at '$built', HEAD '$head', $dirty modified files. Confirm in source or rebuild."
+            }
+            python -m graphify query $Query --graph $graph
+        }
+    }
+}

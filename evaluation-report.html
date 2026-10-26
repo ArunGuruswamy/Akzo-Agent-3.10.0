@@ -1,0 +1,303 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="author" content="Arun RG">
+<title>Akzo SDD Evaluation</title>
+<style>
+:root{--bg:#f7f8fa;--surface:#fff;--text:#1d2330;--muted:#5b6475;--border:#dde2ea;--accent:#1f5fbf;--code:#f1f3f7;--pass:#1e7b46;--pass-soft:#e6f4ec;--fail:#b42318;--fail-soft:#fdecea;--nv:#9a5b00;--nv-soft:#fff4e0;--na:#5b6475;--na-soft:#eef0f4}
+@media (prefers-color-scheme:dark){:root{--bg:#12151b;--surface:#1a1f28;--text:#e6e9ef;--muted:#9aa3b2;--border:#2c3340;--accent:#7aa7ef;--code:#222833;--pass:#5cc28a;--pass-soft:#16281f;--fail:#f07a6e;--fail-soft:#2e1a18;--nv:#e0a84a;--nv-soft:#2d2414;--na:#9aa3b2;--na-soft:#232833}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:16px/1.55 "Segoe UI",system-ui,-apple-system,sans-serif}
+header{background:var(--surface);border-bottom:1px solid var(--border);padding:28px 16px}
+header div,main{max-width:1000px;margin:0 auto}
+h1{margin:0 0 4px;font-size:1.7rem}
+.by{margin:0 0 6px;font-weight:600}
+header p{margin:0;color:var(--muted)}
+nav{max-width:1000px;margin:16px auto 0;padding:0 16px;display:flex;flex-wrap:wrap;gap:6px}
+nav a{font-size:.85rem;padding:4px 10px;border:1px solid var(--border);border-radius:999px;color:var(--accent);text-decoration:none;background:var(--surface)}
+nav a:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+main{padding:8px 16px 48px}
+section{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:20px;margin:16px 0}
+h2{margin:0 0 12px;font-size:1.25rem}
+h3{margin:18px 0 8px;font-size:1.02rem}
+.muted{color:var(--muted)}
+code{background:var(--code);padding:1px 5px;border-radius:4px;font:.88em Consolas,"Cascadia Mono",monospace;word-break:break-word}
+pre{background:var(--code);border:1px solid var(--border);border-radius:8px;padding:12px;overflow-x:auto;font:.86rem/1.45 Consolas,"Cascadia Mono",monospace}
+.table-wrap{overflow-x:auto}
+table{border-collapse:collapse;width:100%;font-size:.9rem}
+th,td{border-bottom:1px solid var(--border);padding:8px;text-align:left;vertical-align:top}
+th{color:var(--muted);font-weight:600}
+.s{display:inline-block;padding:1px 8px;border-radius:999px;font-size:.78rem;font-weight:700;white-space:nowrap}
+.PASS{color:var(--pass);background:var(--pass-soft)}.FAIL{color:var(--fail);background:var(--fail-soft)}
+.NV{color:var(--nv);background:var(--nv-soft)}.NA{color:var(--na);background:var(--na-soft)}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px}
+.card{border:1px solid var(--border);border-radius:8px;padding:12px}
+.card b{display:block;margin-bottom:6px}
+.note{background:var(--nv-soft);border-left:4px solid var(--nv);padding:10px 12px;border-radius:6px;margin:12px 0}
+ol li,ul li{margin:4px 0}
+footer{max-width:1000px;margin:0 auto;padding:0 16px 32px;color:var(--muted);font-size:.85rem}
+</style>
+</head>
+<body>
+<header><div>
+  <h1>Akzo SDD Agent: evaluation report</h1>
+  <p class="by">Akzo SDD Agent — Developed and maintained by Arun RG</p>
+  <p>Evaluation date 2026-10-19. Subject: the Akzo-Agent working tree (no commits yet, E8). Statuses: <span class="s PASS">PASS</span> <span class="s FAIL">FAIL</span> <span class="s NV">NOT VERIFIED</span> <span class="s NA">NOT APPLICABLE</span>.</p>
+</div></header>
+<nav aria-label="Sections">
+  <a href="#summary">Summary</a><a href="#evidence">Evidence</a><a href="#arch">Architecture</a><a href="#agent">1. Agent quality</a>
+  <a href="#sonar">2a. Sonar</a><a href="#tests">2b. Tests &amp; coverage</a><a href="#bench">Benchmark</a><a href="#limits">Limitations</a>
+</nav>
+<main>
+
+<section id="summary">
+  <h2>Summary</h2>
+  <p>Two separate evaluations. <b>Part 1</b> covers the agent, installer, and configuration, and is backed by executed checks. <b>Part 2</b> covers application changes produced with the agent. No Akzo repository was accessible and no Copilot session could be run here, so Part 2 is not verified. Good agent instructions are not evidence that generated code meets quality standards.</p>
+  <div class="cards">
+    <div class="card"><b>Agent file, helper, templates</b><span class="s PASS">PASS</span> <span class="muted">E1</span></div>
+    <div class="card"><b>Activation and isolation (file level)</b><span class="s PASS">PASS</span> <span class="muted">E1, E3</span></div>
+    <div class="card"><b>Isolation at chat run time</b><span class="s NV">NOT VERIFIED</span></div>
+    <div class="card"><b>Install, update, uninstall</b><span class="s PASS">PASS</span> <span class="muted">E1</span></div>
+    <div class="card"><b>Script static analysis</b><span class="s PASS">PASS</span> <span class="muted">E2</span></div>
+    <div class="card"><b>Script line/branch coverage</b><span class="s NV">NOT VERIFIED</span></div>
+    <div class="card"><b>Agent visible in IDE picker</b><span class="s NV">NOT VERIFIED</span></div>
+    <div class="card"><b>Sonar compliance of app changes</b><span class="s NV">NOT VERIFIED</span> <span class="muted">E5</span></div>
+    <div class="card"><b>App tests and coverage</b><span class="s NV">NOT VERIFIED</span> <span class="muted">E6</span></div>
+    <div class="card"><b>Repository memory, incremental indexing, retrieval (fixtures)</b><span class="s PASS">PASS</span> <span class="muted">E1</span></div>
+    <div class="card"><b>G8 controls implemented and tested</b><span class="s PASS">PASS</span> <span class="muted">E1, E10</span></div>
+    <div class="card"><b>G8 corporate approval, Sonar, dependency and secret scanners</b><span class="s NV">NOT VERIFIED</span> <span class="muted">E10</span></div>
+    <div class="card"><b>Copilot benchmark</b><span class="s NV">NOT YET BENCHMARKED</span></div>
+  </div>
+</section>
+
+<section id="evidence">
+  <h2>Evidence sources</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>ID</th><th>Source</th><th>Details</th></tr></thead>
+    <tbody>
+      <tr><td>E1</td><td><code>scripts\test.ps1</code></td><td>Windows PowerShell 5.1.22621.6133, Git 2.51.0. Result (2026-10-26, v3.4.1): 264 passed, 0 failed (task-id traversal, instruction-like facts, and https and redirect handling of the Sonar token included): one shipped agent; repository memory on C#, Angular, and Python fixture repositories (symbols, frameworks, incremental refresh after edits, untracked files, commits, deletes and renames, facts that go stale and expire, ranked retrieval within budgets, corrupt-memory recovery, migration from a 3.3.0 index, repository isolation); G8 preflight, policy, command guard (positive, negative, and adversarial cases), secret and suppression scan, redaction, owner-only memory folders, purge, release integrity, syntax-tree audit of the shipped scripts; Sonar setup detection, read-only Sonar Web API queries against a local stand-in server (gate with analysis commit, issues, rule, error status), token only in the request header, changed-line coverage from Cobertura and LCOV; project-agnostic wording (no project, application, or vendor names in agent or templates); Gated default and approval gates; gap map with five classes and a recorded search; install, upgrade, rerun, repair, rollback, AddRepo with first architecture discovery, memory-leak cleanup, VS Code settings and auto-approve rule; pick with supporting documents, attach, role correction, input manifest, duplicate/missing/unsupported/second-primary detection, .docx/.xlsx extraction and cache reuse, change detection, interrupted-processing recovery, architecture index (roles, refresh on a new commit, per-repository isolation, nothing written into the repository), launchers, uninstall. Temporary profile and fixture repositories.</td></tr>
+      <tr><td>E1b</td><td><code>scripts\test-gui.ps1</code></td><td>Run 2026-10-26 on this desktop (v3.4.1): 11 passed, 0 failed. Start-Development.cmd opened the PBI dialog, then the multi-select supporting-documents dialog; two documents chosen together were copied under supporting\ and reported; the setup window Verify button showed VERIFY OK; uninstall asked first and kept repos.json. Temporary profile.</td></tr>
+      <tr><td>E1c</td><td>Copilot Chat 0.70.0 bundled with VS Code (extension.js, package.nls.json)</td><td>User memory <code>/memories/</code> is stored in <code>globalStorage\github.copilot-chat\memory-tool\memories</code>; "First 200 lines are loaded into your context automatically" for all workspaces and conversations; repository memory in <code>workspaceStorage\&lt;id&gt;\...\memory-tool\memories\repo</code>; commands "Show Memory Files" and "Clear All Memory Files".</td></tr>
+      <tr><td>E9</td><td><code>scripts\benchmark.ps1</code></td><td>Run 2026-10-26: helper timings, output sizes, memory behaviour, and a 3.3.0 to 3.4.0 upgrade on a generated 663-file repository; Windows PowerShell 5.1.22621.6133, Git 2.51.0, i7-13620H, 16 GB. Results: <code>benchmark\results-3.4.1.md</code>.</td></tr>
+      <tr><td>E10</td><td>G8 evaluation, 2026-10-26</td><td><code>akzo.ps1 security</code> on a fixture repository through a real installation (6 installed files matched the SHA-256 manifest). Outcome NOT VERIFIED: no administrator policy and no Sonar server. Details and limitations: <code>corporate-security-report.html</code>.</td></tr>
+      <tr><td>E2</td><td>PSScriptAnalyzer 1.24.0 (bundled with the VS Code PowerShell extension 2025.4.0)</td><td>Default rules on all six scripts (<code>install.ps1</code>, <code>Install-MasterAgent.ps1</code>, <code>Start-Development.ps1</code>, <code>test.ps1</code>, <code>test-gui.ps1</code>, <code>akzo.ps1</code>), 2026-10-21: 0 errors, 0 warnings, 7 information (positional calls of an internal helper in <code>akzo.ps1</code>).</td></tr>
+      <tr><td>E3</td><td>VS Code 1.136.1 installed files</td><td>Workbench bundle and bundled Copilot extension: agent/skill discovery defaults, skill list added to agent prompts, "Allow reading external files?" confirmation, <code>github.copilot.chat.additionalReadAccessPaths</code>.</td></tr>
+      <tr><td>E4</td><td>Official documentation, retrieved 2026-10-19</td><td>code.visualstudio.com: custom agents, agent skills. learn.microsoft.com: Copilot agents and Agent Skills in Visual Studio.</td></tr>
+      <tr><td>E5</td><td>Workspace inventory, 2026-10-19</td><td>No Akzo reference repositories on this machine; Visual Studio 2022 only; no SonarScanner installed; no Sonar configuration in Akzo-Agent.</td></tr>
+      <tr><td>E6</td><td><code>examples\DEMO-101-gloss-measurement-range\</code></td><td>Workflow followed manually on synthetic fixture repositories with the real helper script. Not a Copilot run.</td></tr>
+      <tr><td>E7</td><td>File size measurement, 2026-10-19</td><td>Byte counts of the agent file (2026-10-20).</td></tr>
+      <tr><td>E8</td><td><code>git status</code> of Akzo-Agent</td><td>Branch <code>master</code>, no commits; all files untracked and visible.</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="arch">
+  <h2>Agent architecture and supported IDEs</h2>
+  <ul>
+    <li><b>Agent</b> <code>akzo-master-sdd.agent.md</code> (the only agent since 3.0.0): Start Development with file dialog, intake, investigate (with quality baseline), spec, plan, test-first implementation, autonomous Build/Test/Analyze/Fix loop with gates and gate integrity, review and handover; engineering skills S1-S19; decision classes; questions in one batch with options; modes Run (default), Plan, Align, Debug, Resume; isolation rules (no Copilot memory, no shared instruction files); Git safety. Installed to <code>%USERPROFILE%\.copilot\agents</code> (VS Code) and <code>%USERPROFILE%\.github\agents</code> (Visual Studio 2026).</li>
+    <li><b>Launchers</b> <code>Install-MasterAgent.cmd</code>, <code>Start-Development.cmd</code>, <code>Uninstall-MasterAgent.cmd</code>: Windows Forms front ends over the same installer and helper.</li>
+    <li><b>Helper and templates</b> in <code>%USERPROFILE%\.akzo-agent\modules</code>: one <code>task</code> call returns task, Git state, inputs, repository skills/instructions, and repo map. Not Copilot skills; no workflow files are read at run time (earlier six-module layout removed on 2026-10-20 to cut permission prompts).</li>
+    <li><b>Helper</b> <code>akzo.ps1</code>: registry, Git state, task folders, optional code graph outside repositories.</li>
+    <li><b>Installer</b> <code>install.ps1</code>: hash manifest, backups, dry run, verify, uninstall, target-repository Git check.</li>
+  </ul>
+  <div class="table-wrap"><table>
+    <thead><tr><th>IDE</th><th>Support basis</th><th>Status here</th></tr></thead>
+    <tbody>
+      <tr><td>VS Code (Copilot Chat)</td><td>E4; discovery defaults confirmed in E3</td><td><span class="s NV">NOT VERIFIED</span> in a live session</td></tr>
+      <tr><td>Visual Studio 2026, 18.5+ (user-level agents)</td><td>E4</td><td><span class="s NV">NOT VERIFIED</span>: not installed (E5)</td></tr>
+      <tr><td>Visual Studio 2022</td><td>E4: built-in agents only</td><td><span class="s NA">NOT APPLICABLE</span>: unsupported</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="agent">
+  <h2>Part 1: Agent, installer, and configuration quality</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Check</th><th>Evidence</th><th>Status</th></tr></thead>
+    <tbody>
+      <tr><td>Agent frontmatter: <code>name</code>, <code>description</code>, no <code>tools</code> list; VS Code copy has <code>disable-model-invocation: true</code>, Visual Studio copy does not</td><td>E1</td><td><span class="s PASS">PASS</span></td></tr>
+      <tr><td>Agent holds all seven phases; modules folder holds only the helper and templates (nothing a skill scanner could pick up)</td><td>E1</td><td><span class="s PASS">PASS</span></td></tr>
+      <tr><td>Activation case 1 (agent selected): every file path in the installed agent resolves</td><td>E1</td><td><span class="s PASS">PASS</span></td></tr>
+      <tr><td>Activation case 2 (regular agent): no Akzo text in shared skill, instruction, or hook folders; only the two agent files are discovered</td><td>E1, E3</td><td><span class="s PASS">PASS</span> (file level)</td></tr>
+      <tr><td>Regular chat prompt contains no Akzo text at run time</td><td>Needs Show Chat Debug View in a live session</td><td><span class="s NV">NOT VERIFIED</span></td></tr>
+      <tr><td>No globally applied instruction files shipped (<code>AGENTS.md</code>, <code>copilot-instructions.md</code>)</td><td>E1</td><td><span class="s PASS">PASS</span></td></tr>
+      <tr><td>Install dry run writes nothing; uninstall dry run removes nothing</td><td>E1</td><td><span class="s PASS">PASS</span></td></tr>
+      <tr><td>Install, idempotent rerun, registry preserved, replaced file backed up, unrelated agent and skill preserved</td><td>E1</td><td><span class="s PASS">PASS</span></td></tr>
+      <tr><td>Migration from the earlier shared-skill layout (backed up, then removed)</td><td>E1</td><td><span class="s PASS">PASS</span></td></tr>
+      <tr><td>Verify detects edited files and a planted <code>akzo-*</code> skill in a shared folder</td><td>E1</td><td><span class="s PASS">PASS</span></td></tr>
+      <tr><td><code>-Target</code> and custom Visual Studio agents folder; a plain rerun keeps the recorded choices; backups keep full original paths</td><td>E1</td><td><span class="s PASS">PASS</span></td></tr>
+      <tr><td>Uninstall removes agent, helper, templates, and the VS Code settings block, keeps registry, tasks, and unrelated customizations</td><td>E1</td><td><span class="s PASS">PASS</span></td></tr>
+      <tr><td>Real user profile untouched by tests</td><td>E1</td><td><span class="s PASS">PASS</span></td></tr>
+      <tr><td>Refined-PBI intake (simulated, helper level): PBI ID and full path resolve the task folder and target repo; NOT_FOUND, NO_REFINED_PBI, AMBIGUOUS, NEEDS_REPO, UNKNOWN_REPO reported without creating files; spec/plan/evidence created beside refined-pbi.md or in the repo's specsDir feature folder; other task-folder files listed as inputs; repository skills and instructions discovered (root and src\.github); refined-pbi.md never modified; edited PBI detected against the baseline; resume never overwrites; task folder inside a Git repo refused; configurable <code>tasksDir</code>; installer stops on invalid <code>repos.json</code>. Copilot executing this workflow: NOT VERIFIED.</td><td>E1</td><td><span class="s PASS">PASS</span></td></tr>
+      <tr><td>Helper: rejects unsafe work-item ids; falls back with GRAPHIFY_UNAVAILABLE when Python is missing; external task folders outside the repo, repo mode visible in Git, no overwrite, pre-existing changes reported, graph stored outside the repo with stale warning</td><td>E1</td><td><span class="s PASS">PASS</span></td></tr>
+      <tr><td>Static analysis of scripts: 0 errors, 0 warnings. 4 Information findings (<code>PSAvoidUsingPositionalParameters</code>) on the native-command wrapper in <code>akzo.ps1</code>, accepted by design and not suppressed</td><td>E2</td><td><span class="s PASS">PASS</span></td></tr>
+      <tr><td>Line/branch coverage of the scripts</td><td>Not measured: tests run the scripts in child processes, which Pester 3.4 coverage cannot instrument</td><td><span class="s NV">NOT VERIFIED</span></td></tr>
+      <tr><td>Target-repository Git status before and after construction and install tests</td><td>No target repositories present (E5); fixture repository status identical (E1)</td><td><span class="s NA">NOT APPLICABLE</span></td></tr>
+      <tr><td>Agent appears in the IDE picker and follows its workflow in a live session</td><td>No IDE session executed</td><td><span class="s NV">NOT VERIFIED</span></td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="sonar">
+  <h2>Part 2a: SonarQube / SonarCloud compliance of application changes</h2>
+  <p><b>Repository Sonar configuration: <span class="s NV">NOT VERIFIED</span>.</b> No target repository was accessible (E5), so no <code>sonar-project.properties</code>, pipeline Sonar step, quality profile, quality gate, <code>.editorconfig</code>, or analyzer settings could be inspected. No profile or threshold is assumed.</p>
+  <h3>Traceability</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Rule or requirement</th><th>Enforcement mechanism</th><th>Validation evidence</th><th>Status</th></tr></thead>
+    <tbody>
+      <tr><td colspan="4"><b>Instructed by the agent</b> (instructions are not proof of compliance)</td></tr>
+      <tr><td>Use the repository's own rules, gate, and coverage settings; no invented profile or threshold</td><td>agent section 6 (Validate)</td><td>Instruction text only</td><td><span class="s NV">NOT VERIFIED</span></td></tr>
+      <tr><td>Never disable rules, add suppressions or coverage exclusions, or lower thresholds to pass</td><td>agent section 6 (Validate)</td><td>Instruction text only</td><td><span class="s NV">NOT VERIFIED</span></td></tr>
+      <tr><td>No deleted, skipped, or weakened tests</td><td>agent section 6 (Validate)</td><td>Instruction text only</td><td><span class="s NV">NOT VERIFIED</span></td></tr>
+      <tr><td>Async with cancellation tokens; no blocking waits</td><td>agent section 5 (Implement)</td><td>Instruction text only</td><td><span class="s NV">NOT VERIFIED</span></td></tr>
+      <tr><td>Logging without secrets or personal data; input validated at boundaries</td><td>agent sections 5 and 7</td><td>Instruction text only</td><td><span class="s NV">NOT VERIFIED</span></td></tr>
+      <tr><td>Generated clients changed only by regeneration</td><td>agent section 5 (Implement)</td><td>Instruction text only</td><td><span class="s NV">NOT VERIFIED</span></td></tr>
+      <tr><td colspan="4"><b>Checked by local analyzers</b></td></tr>
+      <tr><td>Target repository analyzers and <code>.editorconfig</code> rules (Roslyn, SonarAnalyzer packages if referenced)</td><td>Build of changed projects (agent section 6)</td><td>No repository available</td><td><span class="s NV">NOT VERIFIED</span></td></tr>
+      <tr><td>Angular lint rules</td><td>Repository lint command</td><td>No repository available</td><td><span class="s NV">NOT VERIFIED</span></td></tr>
+      <tr><td>Agent's own PowerShell scripts</td><td>PSScriptAnalyzer default rules</td><td>E2: 0 errors, 0 warnings</td><td><span class="s PASS">PASS</span></td></tr>
+      <tr><td colspan="4"><b>Confirmed by an actual Sonar analysis</b></td></tr>
+      <tr><td>Target repository quality gate on the change</td><td>Repository pipeline Sonar step or authorized local scan</td><td>No analysis run</td><td><span class="s NV">NOT VERIFIED</span></td></tr>
+      <tr><td>Sonar analysis of Akzo-Agent itself</td><td>None configured or required in this repository (E5)</td><td>—</td><td><span class="s NA">NOT APPLICABLE</span></td></tr>
+    </tbody>
+  </table></div>
+  <h3>Sonar analysis record</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Field</th><th>Value</th></tr></thead>
+    <tbody>
+      <tr><td>Analyzed commit</td><td><span class="s NV">NOT VERIFIED</span></td></tr>
+      <tr><td>Analysis date</td><td><span class="s NV">NOT VERIFIED</span></td></tr>
+      <tr><td>Quality gate result</td><td><span class="s NV">NOT VERIFIED</span></td></tr>
+      <tr><td>New-code issues (bugs, code smells)</td><td><span class="s NV">NOT VERIFIED</span></td></tr>
+      <tr><td>Security findings (vulnerabilities, hotspots)</td><td><span class="s NV">NOT VERIFIED</span></td></tr>
+      <tr><td>Duplication on new code</td><td><span class="s NV">NOT VERIFIED</span></td></tr>
+      <tr><td>Coverage on new code</td><td><span class="s NV">NOT VERIFIED</span></td></tr>
+    </tbody>
+  </table></div>
+  <h3>Remaining steps</h3>
+  <ol>
+    <li>Set each target repository's local path in <code>%USERPROFILE%\.akzo-agent\repos.json</code>.</li>
+    <li>Run the agent's investigation; it records the repository's Sonar configuration files, pipeline Sonar step, analyzer settings, and coverage settings with paths.</li>
+    <li>Get the analysis from the repository's own route: push the change branch and open a pull request so the pipeline's Sonar step runs, or, with authorization, run the scanner command the repository documents, using a token from your own secret store (never committed).</li>
+    <li>From the SonarQube/SonarCloud project page or Web API for that commit, copy the gate result, new-code issues, security findings, duplication, and new-code coverage into the record above.</li>
+    <li>Fix valid findings in code. If a finding seems wrong, record the reasoning and let the rule owner decide; do not suppress it.</li>
+  </ol>
+</section>
+
+<section id="tests">
+  <h2>Part 2b: Test cases and coverage of application changes</h2>
+  <p>The only application change evaluated is the hypothetical DEMO-101 sample on synthetic fixtures (E6). It shows the mapping the agent must produce; it is not evidence about Akzo code.</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Criterion / rule</th><th>Test case (DEMO-101 fixture)</th><th>Kind</th><th>CDMS</th><th>DAB</th><th>Executed</th></tr></thead>
+    <tbody>
+      <tr><td>AC1 / BR1: out-of-range gloss rejected</td><td><code>Gloss_range_is_enforced_for_both_sources</code> with -0.1 and 150.1</td><td>validation failure, boundary</td><td>yes</td><td>yes</td><td><span class="s NV">NOT VERIFIED</span></td></tr>
+      <tr><td>AC2: in-range gloss accepted</td><td>same test with 0 and 150</td><td>happy path, boundary</td><td>yes</td><td>yes</td><td><span class="s NV">NOT VERIFIED</span></td></tr>
+      <tr><td>AC3 / BR2: same rule for CDMS and DAB</td><td>same test loops both sources</td><td>path coverage</td><td>yes</td><td>yes</td><td><span class="s NV">NOT VERIFIED</span></td></tr>
+      <tr><td>AC4: other kinds unaffected</td><td>none written</td><td>regression</td><td>—</td><td>—</td><td><span class="s FAIL">FAIL</span> (gap)</td></tr>
+      <tr><td>Existing behavior: unknown source rejected</td><td><code>Rejects_unknown_source</code> (pre-existing)</td><td>regression</td><td colspan="2">n/a</td><td><span class="s NV">NOT VERIFIED</span></td></tr>
+    </tbody>
+  </table></div>
+  <ul>
+    <li><b>Tests added or changed:</b> 1 test added (4 data rows × 2 sources) in the fixture (E6).</li>
+    <li><b>Executed / passed / failed / skipped:</b> 0 / 0 / 0 / 0. The fixture has no project file, so <code>dotnet test</code> could not run (E6).</li>
+    <li><b>Line, branch, and changed-code coverage:</b> <span class="s NV">NOT VERIFIED</span>; no coverage tool ran and no artifact exists.</li>
+    <li><b>Uncovered behavior and risk:</b> AC4 has no test. Practical risk: a later edit could apply the range to all measurement kinds without a failing test. The review in the evaluation caught this; the sample plan now lists it as a gap.</li>
+    <li><b>Commands the agent must use in a real repository:</b> the repository's own test and coverage commands (for example <code>dotnet test &lt;project&gt; --collect:"XPlat Code Coverage"</code> only when coverlet is referenced), with coverage artifact paths and any exclusions reported.</li>
+  </ul>
+</section>
+
+<section id="bench">
+  <h2>Benchmark</h2>
+  <h3>Helper benchmark, 3.3.0 against 3.4.1 (measured, E9)</h3>
+  <p>Wall-clock time per helper call (Windows PowerShell start-up included); cold and warm rows are interleaved medians, other rows single runs, on a generated repository of 663 tracked files with one commit. Output size is what enters the model's context. Machine load varied between runs, which is why versions were interleaved.</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Metric</th><th>3.3.0</th><th>3.4.1</th><th>Kind</th></tr></thead>
+    <tbody>
+      <tr><td>First discovery (cold <code>task</code>), interleaved, median of 6 rounds</td><td>1682 ms</td><td>3078 ms (+83%; 3.4.0: 3424 ms, +104%)</td><td>measured</td></tr>
+      <tr><td>Same task again (warm), interleaved, median of 6 rounds</td><td>1484 ms</td><td>1820 ms (+23%; 3.4.0: 2249 ms, +52%)</td><td>measured</td></tr>
+      <tr><td>Second PBI start-up (single run)</td><td>1069 ms</td><td>1284 ms (+20%)</td><td>measured</td></tr>
+      <tr><td>Start-up after an uncommitted new file (single run)</td><td>1045 ms</td><td>1763 ms (+69%)</td><td>measured</td></tr>
+      <tr><td>Uncommitted new file appears in the index</td><td>no</td><td>yes</td><td>measured</td></tr>
+      <tr><td><code>task</code> output size (warm)</td><td>2482 chars</td><td>3746 chars (+51%)</td><td>measured</td></tr>
+      <tr><td>Selecting files for one requirement</td><td>index term search: 41 lines, 2646 chars</td><td><code>context</code>: 8493 chars, 2938 ms median, expected validator ranked first</td><td>measured</td></tr>
+      <tr><td>Memory hit rate over the run</td><td>not recorded</td><td>78.6%</td><td>measured</td></tr>
+      <tr><td>Upgrade keeps an existing task working (after the one-time authorization)</td><td></td><td>PASS</td><td>measured</td></tr>
+      <tr><td>Model interactions, tokens, files read, manual interactions in Copilot</td><td></td><td></td><td><span class="s NV">NOT VERIFIED</span></td></tr>
+    </tbody>
+  </table></div>
+  <div class="note">3.4.1 is slower per call than 3.3.0: it fingerprints every file on each call and runs the G8 checks. What it adds is detection of uncommitted changes and ranked retrieval. Whether that reduces model effort or cost in real Copilot sessions is not measured and is not claimed. In interleaved runs 3.4.1 is about 10% faster cold and 19% faster warm than 3.4.0, with every check kept (<code>benchmark\interleaved-3.4.1.md</code>). Single-run rows are marked; the interleaved rows supersede single-run cold and warm figures.</div>
+  <h2>Copilot speed and efficiency benchmark</h2>
+  <p><b>Status: <span class="s NV">NOT YET BENCHMARKED</span>.</b> No GitHub Copilot session was executed for this report. No speed, effort, or cost improvement is claimed.</p>
+  <h3>Design</h3>
+  <ul>
+    <li><b>Arms:</b> A = regular GitHub Copilot (built-in Agent) with the same requirement text, acceptance criteria, and a list of the same relevant files. B = the akzo-master-sdd custom agent.</li>
+    <li><b>Tasks</b> (chosen by a facilitator from a real Akzo repository before any run, with acceptance criteria written in advance): T1 a bounded defect fix with a reproducible failure; T2 a small API feature (one field or endpoint, with validation and tests).</li>
+    <li><b>Controls:</b> same starting commit, IDE and version, model, permissions and tool settings, dependencies restored in advance, same acceptance criteria and done definition.</li>
+    <li><b>Runs:</b> at least 3 per arm per task (5 preferred), alternating which arm runs first. Record the first akzo-master-sdd run after installation separately as cold start (registry setup, first investigation, optional graph build).</li>
+  </ul>
+  <h3>Procedure for one run</h3>
+  <ol>
+    <li>Create an isolated checkout without touching the reference repository's own <code>.git</code>:
+      <pre>git clone --quiet "&lt;reference repo path&gt;" "$env:USERPROFILE\.akzo-agent\benchmark\&lt;task&gt;-&lt;arm&gt;-&lt;run&gt;"
+git -C "$env:USERPROFILE\.akzo-agent\benchmark\&lt;task&gt;-&lt;arm&gt;-&lt;run&gt;" checkout --detach &lt;start commit&gt;</pre></li>
+    <li>For arm B, point the registry entry's <code>path</code> at that checkout (and restore it afterwards).</li>
+    <li>Open the checkout in the IDE, select the arm's agent and model, and start a stopwatch with the first prompt.</li>
+    <li>Log a timestamp at each phase change: investigation, spec/plan (arm B includes writing spec.md and plan.md), implementation, validation. Separately log active human time (typing, reading, answering, approving).</li>
+    <li>Count clarification rounds, correction rounds (human-requested fixes), build attempts, and test attempts.</li>
+    <li>Stop when the arm declares done or after a fixed time box (e.g. 90 minutes); mark incomplete runs as not completed.</li>
+    <li>A reviewer who did not run the session, blinded to the arm where practical, scores acceptance criteria and records defects. Run the repository's tests, coverage, and Sonar route on the result.</li>
+    <li>Record tokens only from reliable product telemetry; otherwise write <code>NOT AVAILABLE</code>. Tool calls and files read may be recorded as labeled proxies only.</li>
+    <li>Append one row per run to <code>benchmark\results-template.csv</code> (copy it first).</li>
+  </ol>
+  <h3>Analysis rules</h3>
+  <ul>
+    <li>Compare only completed runs that satisfy all acceptance criteria. Report per arm and task: n, median, and min-max of total elapsed and active human time; the cold start reported on its own.</li>
+    <li>Report differences with n and spread. With fewer than 3 comparable runs per arm, report raw values only and draw no conclusion.</li>
+    <li>Include spec/plan documentation time in arm B totals. Never convert proxies into token or cost figures.</li>
+  </ul>
+  <h3>Results (empty)</h3>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Task</th><th>Arm</th><th>n</th><th>Median total (min)</th><th>Range</th><th>Median active human (min)</th><th>ACs met</th><th>Defects</th><th>Tokens</th></tr></thead>
+    <tbody>
+      <tr><td>T1 defect</td><td>A Copilot</td><td>0</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>NOT AVAILABLE</td></tr>
+      <tr><td>T1 defect</td><td>B akzo-master-sdd</td><td>0</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>NOT AVAILABLE</td></tr>
+      <tr><td>T2 API feature</td><td>A Copilot</td><td>0</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>NOT AVAILABLE</td></tr>
+      <tr><td>T2 API feature</td><td>B akzo-master-sdd</td><td>0</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>NOT AVAILABLE</td></tr>
+    </tbody>
+  </table></div>
+  <h3>Static findings (proxies, not performance results)</h3>
+  <ul>
+    <li>Agent file: 45,222 bytes (E7, 2026-10-22), the whole workflow, loaded once when the agent is selected. No module reads, so no read prompts and no extra round trips per phase.</li>
+    <li>These byte counts are context-size proxies. They are not token counts and say nothing about speed.</li>
+  </ul>
+</section>
+
+<section id="limits">
+  <h2>Known limitations and recommended improvements</h2>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Limitation</th><th>Impact</th><th>Recommended next step</th></tr></thead>
+    <tbody>
+      <tr><td>No Akzo repositories accessible (E5)</td><td>Architecture, business rules, Sonar setup, and build/test commands are unverified</td><td>Configure <code>repos.json</code>; run a planning-only task and review the recorded evidence</td></tr>
+      <tr><td>No live IDE session</td><td>Picker discovery, permission prompts, askQuestions use, and run-time isolation unverified</td><td>Follow the checks in the installation guide in VS Code and Visual Studio 2026 18.5+</td></tr>
+      <tr><td>Visual Studio file reads outside the solution undocumented</td><td>Module loading may need the terminal fallback and an approval</td><td>Test on Visual Studio 2026; update the guide with the observed behavior</td></tr>
+      <tr><td>Script coverage unmeasured</td><td>Untested branches in the installer are possible</td><td>Move core functions into an in-process module and add Pester tests with coverage</td></tr>
+      <tr><td>Agent behavior (stop rules, no suppressions, honest reporting) not measured</td><td>Instructions may be followed inconsistently</td><td>Run the benchmark and review transcripts against the stop conditions</td></tr>
+      <tr><td>Sample AC4 lacks a test (E6)</td><td>Shows that criteria-to-test mapping must be reviewed, not assumed</td><td>Keep the handover test table mandatory (agent section 7)</td></tr>
+      <tr><td>The command guard is run by the agent</td><td>Copilot offers no hook that forces it; the command log (G8 DLP and script-safety controls) shows only what the agent reported</td><td>Keep the IDE's own terminal approvals on; compare the log with the IDE's command history; ask the platform team for an enforcement hook</td></tr>
+      <tr><td>Developer authorization is a statement, not approval, and its file is not protected</td><td>G8 reports it NOT VERIFIED; approved-model checks use the model name the developer states. Any process running as the user, including a model with file-edit or terminal tools, can write <code>authorizations.json</code> directly; the IDE confirmation of <code>authorize</code> and the agent instructions do not enforce approval</td><td>An administrator places a user-unwritable policy file with <code>allowDeveloperAttestation</code> set to false; the organization approves models and repositories</td></tr>
+      <tr><td>Scripts are not code-signed; <code>-ExecutionPolicy Bypass</code> is used to start them</td><td>Group Policy that enforces AllSigned can prevent the helper from running; the bypass needs security review</td><td>Sign with the organization's certificate; review the bypass with security</td></tr>
+      <tr><td>Built-in secret, suppression, and dependency detection is pattern-based; Sonar, secret, and dependency scanners were not available</td><td>Findings can be missed or noisy</td><td>Run the organization's approved scanners; configure Sonar for the repository</td></tr>
+      <tr><td>Symbol extraction uses regular expressions</td><td>Generics, nested types, and unusual syntax can be missed; ranking is not proof</td><td>The agent reads cited lines; a parser could be added if measurements justify it</td></tr>
+      <tr><td>Memory is protected by file permissions, not encrypted; retention covers facts only</td><td>Administrators and backup tools can read it; logs, task folders, and reports are not expired</td><td>Disk encryption, retention rules for the Akzo folders, keep <code>tasksDir</code> out of synchronized folders</td></tr>
+      <tr><td>Visual Studio 2026, real Copilot runs, and a real corporate policy were not tested</td><td>Behaviour in those environments is unverified</td><td>Pilot in a controlled environment before wider use</td></tr>
+      <tr><td>License not selected; no commits yet (E8)</td><td>Distribution terms undefined; changes not yet versioned</td><td>Confirm ownership and organizational requirements, choose a license, then commit</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+</main>
+<footer>Akzo SDD Agent — Developed and maintained by Arun RG · Self-contained; works offline.</footer>
+</body>
+</html>

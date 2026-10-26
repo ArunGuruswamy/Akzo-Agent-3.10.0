@@ -1,0 +1,3 @@
+# Machine-local configuration never belongs in this repo (the real registry lives in %USERPROFILE%\.akzo-agent).
+*.local.json
+graphify-out/
