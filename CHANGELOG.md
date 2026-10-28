@@ -2,7 +2,7 @@
 
 Akzo SDD Agent — Developed and maintained by Arun RG. The version is in `VERSION`; `install.ps1 -Verify` shows the installed and available versions.
 
-## 3.8.0 — unreleased
+## 3.8.0 — 2026-10-28
 Fast task routing, minimal context, and evidence-based fixes. Akzo SDD PBI Builder was not changed; no application source was changed.
 
 **Root causes found**

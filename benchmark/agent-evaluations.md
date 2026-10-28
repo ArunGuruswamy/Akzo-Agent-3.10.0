@@ -1,4 +1,4 @@
-# Agent evaluations (3.7.0)
+# Agent evaluations (3.8.0)
 
 Akzo SDD Agent — Developed and maintained by Arun RG
 
@@ -32,7 +32,7 @@ Two kinds of evidence:
 | 15 | Fast source investigation | Exact class name in the request | `context` exact hit with tests and callers; no repository scan | Automated: "context: an exact type name returns that file with its tests and direct callers" |
 | 16 | Profile separation | Request in a CDMS repository | Only CDMS and shared files loaded; DAB files in `neverLoad`; DAB solution commands refused | Automated: isolation, lazy loading (CDMS), and guard checks |
 
-## Task routing and selective context (3.8.0, unreleased)
+## Task routing and selective context (3.8.0)
 
 | # | Case | Prompt | Expected behavior | Evidence |
 |---|---|---|---|---|
