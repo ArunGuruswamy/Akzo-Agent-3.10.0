@@ -2,6 +2,21 @@
 
 Akzo SDD Agent — Developed and maintained by Arun RG. The version is in `VERSION`; `install.ps1 -Verify` shows the installed and available versions.
 
+## 3.8.0 — unreleased
+Fast task routing, minimal context, and evidence-based fixes. Akzo SDD PBI Builder was not changed; no application source was changed.
+
+**Root causes found**
+- The agent itself told Copilot to always read `copilot-instructions.md` and `AGENTS.md` (section 2), although the IDE already adds them to every request.
+- Every task, a one-line Sonar fix included, went through the PBI pipeline, and `profile -Query` loaded the shared skills plus the profile's core skills: 6-8 guides. Trigger patterns also matched words inside class names (`Create...Handler` matched `create` and `handler`).
+- Repository side (this agent cannot change it): in VS Code 1.143 / Copilot Chat 0.71 (defaults read from the installed product), `copilot-instructions.md`, root `AGENTS.md` and `CLAUDE.md`, and `applyTo: '**'` instructions join every request of every agent. A line there that says "read X before any task" makes every agent read X. Linked files are not attached automatically.
+
+**Added / changed**
+- Agent: "Start and task routing" (the five-choice `start` menu, direct-task routing, a per-mode reading ceiling, IDE-loaded instructions not claimed to be overridden, missing-tool fallbacks); **Fix Issue** and **Refactor** modes (Debug folded into Fix Issue); New Development / Review / Custom map onto the existing modes; evidence rules; the five-line Fix report.
+- `profile -Task fix|refactor|new|review`: fix loads source grounding and the Sonar rules only; refactor adds the guides the smell triggers; new and review are unchanged. Output field `task`.
+- `guidance -Repo <id>` (read-only, auto-approved): instruction files with their load scope, the documents and skills they reference (file:line, mandatory wording, unconditional, affects the regular agent, missing), and a scoping recommendation. `repoGuidance` rows gain `scope`; `CLAUDE.md` is now listed.
+
+**NOT VERIFIED:** live Copilot runs of the routing cases and the S1200 regression case (`benchmark/agent-evaluations.md` 17-27). No DAB or CDMS repository is on this machine, so their instruction files were not audited.
+
 ## 3.7.0 — 2026-10-28
 Faster development loop (lazy profile loading, cached detection, exact-symbol lookup, staged tests) and reusable development and PR-review intelligence for any DAB or CDMS work item. Combines two briefs: the high-performance engine and universal DAB development and PR review. Akzo SDD PBI Builder was not changed, and no application source was changed. No feature was removed; the security controls and every gate are unchanged.
 

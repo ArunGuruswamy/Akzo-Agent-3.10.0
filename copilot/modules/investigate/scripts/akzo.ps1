@@ -35,6 +35,8 @@
   akzo.ps1 profile -Repo backend-functions             # repository development profile (DAB / CDMS / none) and the files to load
   akzo.ps1 review -Repo backend-functions -Base main   # pre-PR review of the branch: recorded PR regression scenarios, profile rules
   akzo.ps1 profile -Repo backend-functions -Query "change the order validator"   # only the profile files this request needs; the rest listed as deferred
+  akzo.ps1 profile -Repo backend-functions -Task fix -Query "S3776 complexity"   # a small fix: source grounding and the Sonar rules only
+  akzo.ps1 guidance -Repo backend-functions            # which repository instruction files make Copilot read which documents, and for which agents
   akzo.ps1 affected -Repo backend-functions -Base main # staged tests: build, focused, affected regression, full suite once
   akzo.ps1 coverage -Repo backend-functions -Report "C:\...\evidence\coverage.cobertura.xml"   # coverage of changed lines
   akzo.ps1 context -Repo backend-functions -Query "validate gloss measurement range" -Mode balanced   # ranked files, symbols, facts
@@ -45,7 +47,7 @@
 #>
 param(
     [Parameter(Position = 0, Mandatory = $true)]
-    [ValidateSet('home', 'registry', 'state', 'inbox', 'pick', 'intake', 'attach', 'role', 'discover', 'task', 'graph', 'sonar', 'coverage', 'remember', 'forget', 'context', 'policy', 'authorize', 'guard', 'scan', 'security', 'purge', 'branchinfo', 'branchcreate', 'branchuse', 'tasks', 'snapshot', 'profile', 'review', 'affected')]
+    [ValidateSet('home', 'registry', 'state', 'inbox', 'pick', 'intake', 'attach', 'role', 'discover', 'task', 'graph', 'sonar', 'coverage', 'remember', 'forget', 'context', 'policy', 'authorize', 'guard', 'scan', 'security', 'purge', 'branchinfo', 'branchcreate', 'branchuse', 'tasks', 'snapshot', 'profile', 'review', 'affected', 'guidance')]
     [string]$Command,
     [string]$Reference,       # authorize: the approval you hold (ticket, policy, or approver)
     [string]$Classification,  # authorize: public | internal | confidential (restricted needs an administrator policy)
@@ -89,7 +91,9 @@ param(
     [switch]$Baseline,
     [switch]$RepoMode,
     [switch]$Update,
-    [string]$Query
+    [string]$Query,
+    [ValidateSet('', 'fix', 'refactor', 'new', 'review')]
+    [string]$Task = ''     # profile: the kind of work; fix and refactor load only source grounding and the Sonar rules (refactor adds topic matches)
 )
 $ErrorActionPreference = 'Stop'
 if ($Rest -and $Command -ne 'guard') { throw "Unexpected argument(s) for '$Command': $($Rest -join ' ')" }   # stray arguments stay an error everywhere but guard
@@ -166,12 +170,15 @@ function Get-WorkspaceRepo {   # the registered repository that contains the cur
     "$($hit.id)"
 }
 
-# The repository's own Copilot/agent customizations (skills, instructions, prompts, AGENTS.md), at the repo root
-# and one folder down (e.g. src\.github). Paths and descriptions only; the agent reads the relevant ones.
+# The repository's own Copilot/agent customizations (skills, instructions, prompts, AGENTS.md, CLAUDE.md), at the repo
+# root and one folder down (e.g. src\.github). Paths and descriptions only; the agent reads the relevant ones.
+# scope = when Copilot adds the file by itself (VS Code defaults checked in Copilot Chat 0.71): every-request (all agents,
+# the regular one included), matching-files (applyTo), by-description (the model chooses), when-invoked, when-selected, or
+# subfolder (only when that folder is the open workspace).
 function Get-RepoGuidance([string]$root) {
     $skip = 'node_modules', 'bin', 'obj', 'dist', '.git', '.angular', '.vs'
     $bases = @($root) + @(Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -notin $skip } | ForEach-Object { $_.FullName })
-    $patterns = 'AGENTS.md', '.github\copilot-instructions.md', '.github\instructions\*.instructions.md', '.github\prompts\*.prompt.md',
+    $patterns = 'AGENTS.md', 'CLAUDE.md', '.github\copilot-instructions.md', '.github\instructions\*.instructions.md', '.github\prompts\*.prompt.md',
         '.github\skills\*\SKILL.md', '.claude\skills\*\SKILL.md', '.agents\skills\*\SKILL.md', '.github\agents\*.agent.md'
     foreach ($b in $bases) {
         foreach ($p in $patterns) {
@@ -179,10 +186,44 @@ function Get-RepoGuidance([string]$root) {
                 $head = (Get-Content -LiteralPath $f.FullName -TotalCount 15 -Encoding UTF8) -join "`n"
                 $desc = if ($head -match '(?m)^description:\s*(.+)$') { $Matches[1].Trim(' ''"') } else { '' }
                 $apply = if ($head -match '(?m)^applyTo:\s*(.+)$') { $Matches[1].Trim(' ''"') } else { '' }
-                [pscustomobject]@{ path = $f.FullName.Substring($root.Length).TrimStart('\'); description = $desc; applyTo = $apply }
+                $scope = if ($b -ne $root) { 'subfolder' } elseif ($p -match '^(AGENTS|CLAUDE)\.md$|copilot-instructions') { 'every-request' }
+                    elseif ($p -match 'instructions\\') { if ($apply -match '^\*\*(/\*(\.\*)?)?$') { 'every-request' } elseif ($apply) { 'matching-files' } else { 'by-description' } }
+                    elseif ($p -match 'prompts') { 'when-invoked' } elseif ($p -match 'agents\\') { 'when-selected' } else { 'by-description' }
+                [pscustomobject]@{ path = $f.FullName.Substring($root.Length).TrimStart('\'); description = $desc; applyTo = $apply; scope = $scope }
             }
         }
     }
+}
+
+# guidance: which instruction files tell Copilot to read which documents, and for whom. A reference is 'unconditional'
+# when its file reaches every request and the line demands the read (always, must, before any task, ... first).
+function Get-GuidanceAudit($r) {
+    $rows = @(Get-RepoGuidance $r.path)
+    $known = @(Invoke-Quiet git -C $r.path -c core.quotepath=off ls-files --cached --others --exclude-standard -- '*.md')
+    $skills = @{}; foreach ($g in $rows | Where-Object { $_.path -match 'skills\\([^\\]+)\\SKILL\.md$' }) { $skills[($g.path -split '\\')[-2]] = $g.path }
+    $demand = '(?i)\b(always|must|mandatory|required|before (any|every|each|starting|you)|at the start)\b|\bread\b.*\bfirst\b'
+    $refs = foreach ($g in $rows) {
+        $n = 0
+        foreach ($line in [IO.File]::ReadAllLines((Join-Path $r.path $g.path))) {
+            $n++
+            $names = @([regex]::Matches($line, '[\w./\\-]+\.md\b') | ForEach-Object { $_.Value.TrimStart('./\') } | Where-Object { $_ -notmatch '\.(instructions|prompt|agent)\.md$' -and ($_ -split '[\\/]')[-1] -ne ($g.path -split '\\')[-1] }) +
+                @($skills.Keys | Where-Object { $line -match "(?i)(?<![\w-])$([regex]::Escape($_))(?![\w-])" -and $skills[$_] -ne $g.path })
+            foreach ($doc in $names | Select-Object -Unique) {
+                $leaf = ($doc -split '[\\/]')[-1]
+                $found = if ($skills.ContainsKey($doc)) { $skills[$doc] -replace '\\', '/' } else { @($known | Where-Object { $_ -eq ($doc -replace '\\', '/') -or ($_ -split '/')[-1] -ieq $leaf }) | Select-Object -First 1 }
+                $must = $line -match $demand
+                [pscustomobject][ordered]@{ document = $doc; found = "$found"; from = "$($g.path):$n"; scope = $g.scope; mandatory = $must
+                    unconditional = ($must -and $g.scope -eq 'every-request'); affectsRegularAgent = ($g.scope -in 'every-request', 'matching-files')
+                    text = $(if ($line.Length -gt 160) { $line.Substring(0, 160) + '...' } else { $line.Trim() }) }
+            }
+        }
+    }
+    $refs = @($refs)
+    $unc = @($refs | Where-Object { $_.unconditional })
+    [pscustomobject][ordered]@{ status = $(if (-not $rows.Count) { 'NO_GUIDANCE' } elseif ($unc.Count) { 'UNCONDITIONAL_LOADS' } else { 'SCOPED' }); repo = $r.id
+        files = $rows; references = $refs; unconditional = $unc.Count; missing = @($refs | Where-Object { -not $_.found } | ForEach-Object { "$($_.document) ($($_.from))" })
+        note = 'Scopes are VS Code defaults (Copilot Chat 0.71: copilot-instructions.md, root AGENTS.md and CLAUDE.md, and matching applyTo files join every request of every agent; linked files are not attached automatically, the model reads them because the text says so; skills load by description). Visual Studio 2022 17.14 reads copilot-instructions.md and .instructions.md files only. Changes to these files are the repository team''s decision: this command never edits them.'
+        recommendation = $(if ($unc.Count) { 'Keep every-request files to short rules for all tasks. Move each unconditional document read into a scoped .github/instructions/<topic>.instructions.md (applyTo the files it concerns) or a skill with a description, phrased as "read <document> when <task or files>".' } else { 'No change needed.' }) }
 }
 
 function Get-InboxItem($i) {   # one inbox entry with the PBI number and title guessed from its name and first heading
@@ -1271,7 +1312,7 @@ function Get-ProfileCacheKey($r, [string]$defsText) {   # HEAD + working-tree st
     }
     Get-TextHash $sb.ToString()
 }
-function Get-RepoProfile($r, [string]$want, [string]$intent) {
+function Get-RepoProfile($r, [string]$want, [string]$intent, [string]$work) {
     $defs = Read-Profiles
     if (-not $defs) { return [pscustomobject][ordered]@{ status = 'NO_PROFILES_INSTALLED'; repo = $r.id; profile = ''; solutions = @(); detail = "no profiles.json under $ProfilesDir" } }
     # Detection is cached per repository; any commit, checkout, edit, new or deleted file, or profile change misses the cache.
@@ -1314,20 +1355,24 @@ function Get-RepoProfile($r, [string]$want, [string]$intent) {
     $o = [ordered]@{ status = $status; repo = $r.id; profile = ''; name = ''; solution = ''; evidence = @()
         solutions = @($slns | ForEach-Object { ($_ -split '/')[-1] } | Select-Object -Unique)
         candidates = @($found | Where-Object { $_.evidence.Count } | ForEach-Object { [pscustomobject][ordered]@{ profile = $_.def.id; solution = "$($_.solution)"; evidence = $_.evidence } }) }
-    $o.cache = $cacheEvent
+    $o.cache = $cacheEvent; $o.task = $(if ($work) { $work } else { 'new' })
     # Lazy loading: with -Query only the core files and the files whose topic matches the request are loaded; the rest of
     # the same profile is 'deferred' (read when the work reaches that topic). Without -Query everything is loaded.
+    # -Task fix / refactor (small technical changes): only source grounding and the Sonar rules; refactor adds the topic matches.
+    $lean = $work -in 'fix', 'refactor'
     $onDemand = @{}; if ($defs.shared.onDemand) { foreach ($pp in $defs.shared.onDemand.PSObject.Properties) { $onDemand[$pp.Name] = $pp.Value } }
     $wanted = { param($file, $rx) (-not $intent) -or ($rx -and $intent -match "(?i)$rx") }
-    $shared = @(@($defs.shared.skills | Where-Object { $_ }) + @($onDemand.Keys | Sort-Object | Where-Object { & $wanted $_ $onDemand[$_] }))
-    $deferred = @($onDemand.Keys | Sort-Object | Where-Object { -not (& $wanted $_ $onDemand[$_]) })
+    $sharedAll = @(@($defs.shared.skills | Where-Object { $_ }) + @($onDemand.Keys | Sort-Object | Where-Object { & $wanted $_ $onDemand[$_] }))
+    $shared = @($sharedAll | Where-Object { -not $lean -or $_ -match 'source-grounded' })
+    $deferred = @(@($sharedAll | Where-Object { $shared -notcontains $_ }) + @($onDemand.Keys | Sort-Object | Where-Object { -not (& $wanted $_ $onDemand[$_]) }))
     if ($pick) {
         $d = $pick.def
         $dir = if ($pick.solution -match '/') { Join-Path $r.path (($pick.solution -replace '/[^/]+$', '') -replace '/', '\') } else { $r.path }
         $missing = @($d.commandFiles | Where-Object { $_ -and -not (Test-Path -LiteralPath (Join-Path $dir $_)) })
         $o.profile = $d.id; $o.name = $d.name; $o.solution = $pick.solution; $o.evidence = $pick.evidence
         $core = @($d.core | Where-Object { $_ })
-        $mine = @($d.skills | Where-Object { $_ -and (-not $intent -or $core -contains $_ -or (& $wanted $_ $d.triggers.$_)) })
+        $mine = @($d.skills | Where-Object { $_ -and $(if ($lean) { $work -eq 'refactor' -and $intent -and $d.triggers.$_ -and $intent -match "(?i)$($d.triggers.$_)" }
+                    else { -not $intent -or $core -contains $_ -or (& $wanted $_ $d.triggers.$_) }) })
         $deferred += @($d.skills | Where-Object { $_ -and $mine -notcontains $_ })
         $o.load = @(@($shared) + $mine + @($d.sonarRules) | Where-Object { $_ } | ForEach-Object { Get-ProfileFile $_ })
         $o.deferred = @($deferred | ForEach-Object { Get-ProfileFile $_ })
@@ -1335,7 +1380,7 @@ function Get-RepoProfile($r, [string]$want, [string]$intent) {
         $o.otherSolutions = @($defs.profiles | Where-Object { $_.id -ne $d.id } | ForEach-Object { $_.solution })
         $o.commands = [ordered]@{ workingDirectory = $dir; build = $d.commands.build; test = $d.commands.test; missingFiles = $missing; verified = (-not $missing.Count) }
         $o.review = $d.review
-        $o.next = "Read every file in 'load' before investigating; read a 'deferred' file as soon as the work reaches its topic (when unsure, read it); never read or apply 'neverLoad'. Run 'commands' from workingDirectory$(if ($missing.Count) { " after checking $($missing -join ', ') (not found next to the solution)" })."
+        $o.next = "Read every file in 'load' before investigating; $(if ($lean) { "read a 'deferred' file only when the $work reaches its topic, and say why in one line" } else { "read a 'deferred' file as soon as the work reaches its topic (when unsure, read it)" }); never read or apply 'neverLoad'. Run 'commands' from workingDirectory$(if ($missing.Count) { " after checking $($missing -join ', ') (not found next to the solution)" })."
     } else {
         $o.load = @($shared | ForEach-Object { Get-ProfileFile $_ })
         $o.deferred = @($deferred | ForEach-Object { Get-ProfileFile $_ })
@@ -2359,7 +2404,12 @@ if ($Command -eq 'snapshot') {
 # profile: which repository development profile applies (DAB, CDMS, or none), with the evidence and the files to load.
 if ($Command -eq 'profile') {
     $r = Resolve-Repo $Repo; $null = Assert-Preflight $r
-    Get-RepoProfile $r $Key $Query | ConvertTo-Json -Depth 5
+    Get-RepoProfile $r $Key $Query $Task | ConvertTo-Json -Depth 5
+    exit 0
+}
+if ($Command -eq 'guidance') {   # read-only audit of the repository's instruction files
+    $r = Resolve-Repo $Repo; $null = Assert-Preflight $r
+    Get-GuidanceAudit $r | ConvertTo-Json -Depth 4
     exit 0
 }
 

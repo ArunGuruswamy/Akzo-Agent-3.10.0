@@ -31,3 +31,27 @@ Two kinds of evidence:
 | 14 | Analysis before approval | "Review this and propose a fix before changing anything" | Analysis, file-by-file proposal, risks, test plan; no file edited | Live. Agent: "Review-only / plan-first" |
 | 15 | Fast source investigation | Exact class name in the request | `context` exact hit with tests and callers; no repository scan | Automated: "context: an exact type name returns that file with its tests and direct callers" |
 | 16 | Profile separation | Request in a CDMS repository | Only CDMS and shared files loaded; DAB files in `neverLoad`; DAB solution commands refused | Automated: isolation, lazy loading (CDMS), and guard checks |
+
+## Task routing and selective context (3.8.0, unreleased)
+
+| # | Case | Prompt | Expected behavior | Evidence |
+|---|---|---|---|---|
+| 17 | start -> Fix Issue | `start`, then `1` | Asks only for the issue; then `branchinfo`, `context`, `profile -Task fix`; Issue / Cause / Fix / Verification / Status | Live. Helper loads: automated "task routing: a fix loads only ..." |
+| 18 | start -> Refactor | `start`, then `Refactor Existing Code` | Asks for the class or smell; measures the metric; reuses an existing abstraction | Live. Helper loads: automated "task routing: a refactor ..." |
+| 19 | start -> New Development | `start`, then `3` | Section 0 (pick the PBI, or the a/b/c choice when tasks are in progress), full pipeline | Live |
+| 20 | start -> Review | `start`, then `4` | Asks what to review; read-only report; no file edited | Live |
+| 21 | Direct Sonar issue | A pasted SonarCloud finding, no `start` | "Mode: Fix Issue ..." in one line, no menu, no PBI or spec | Live |
+| 22 | Direct PBI | `implement PBI 123`, no `start` | New Development, section 1 | Live |
+| 23 | Regular Copilot agent | The same Sonar finding in the default agent | No Akzo workflow (nothing global installed); only the repository's own instruction files apply | Automated: "no globally applied instruction files shipped" and the isolation checks. Repository side: `guidance -Repo <id>` |
+| 24 | Missing source file | A finding naming a class that does not exist | "Not found" with the nearest real files; nothing created | Automated: "missing source: ..." |
+| 25 | Existing uncommitted changes | A fix in a file with local edits | Edits kept, fix applied on top, said in the report | Automated (the helper leaves the file as it was); agent behavior live |
+| 26 | Unsupported IDE tools | Visual Studio 2022 17.14 (no custom agents), or no `askQuestions` | Numbered text choices; no claim that a tool ran | Live. Visual Studio 17.14.31 binaries checked: `copilot-instructions.md`, `.instructions.md` with `applyTo`, `.prompt.md` only |
+
+### Developer-supplied regression case (live, not agent logic)
+
+This case names a class from the developer's repository. It is a test prompt only; neither the agent nor the helper
+reads this file.
+
+| # | Case | Prompt | Expected behavior | Evidence |
+|---|---|---|---|---|
+| 27 | SonarCloud S1200 | "S1200 in CreatePaintSystemHandler.cs: class coupled to 32 types, maximum 30" | Fix Issue mode with the Refactor rules; no architecture documents read first; locates the handler and its tests; lists the referenced types; removes at least two by reusing existing services; no previously removed collaborator recreated (`git log --diff-filter=D`); no new collaborator only to move the count; creation behavior unchanged; build and focused tests run; Sonar "not verified" unless a Sonar source confirms it | Live, NOT VERIFIED (repository not on this machine) |

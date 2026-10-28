@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "note": "Repository development profiles. The helper's 'profile' command selects at most one profile, and only when its solution file is in the repository; markers are supporting evidence, never enough on their own. Paths are relative to this folder; a file with the same relative path under <AKZO_HOME>\\profiles-custom\\ is used instead (upgrades never write there). With 'profile -Query', only 'core', the shared skills, the Sonar rules, and skills whose trigger (a case-insensitive regex) matches the request are loaded; the others are returned as 'deferred'.",
+  "note": "Repository development profiles. The helper's 'profile' command selects at most one profile, and only when its solution file is in the repository; markers are supporting evidence, never enough on their own. Paths are relative to this folder; a file with the same relative path under <AKZO_HOME>\\profiles-custom\\ is used instead (upgrades never write there). With 'profile -Query', only 'core', the shared skills, the Sonar rules, and skills whose trigger (a case-insensitive regex) matches the request are loaded; the others are returned as 'deferred'. 'profile -Task fix' loads only the source-grounded skill and the Sonar rules; '-Task refactor' adds the profile skills whose trigger matches.",
   "shared": {
     "skills": [
       "skills/shared/source-grounded-development/guide.md",
