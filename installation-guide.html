@@ -39,7 +39,7 @@ footer{max-width:960px;margin:0 auto;padding:0 16px 32px;color:var(--muted);font
 <body>
 <header><div>
   <h1>Akzo SDD agent for GitHub Copilot</h1>
-  <p style="font-weight:600;margin:0 0 6px">Akzo Master SDD Agent v3.8.0 (release candidate) — Developed and maintained by Arun RG</p>
+  <p style="font-weight:600;margin:0 0 6px">Akzo Master SDD Agent v3.9.0 (release candidate) — Developed and maintained by Arun RG</p>
   <p>Install, configure, and use the <code>akzo-master-sdd</code> custom agent in VS Code and Visual Studio 2026. Everything below matches the scripts in this repository.</p>
 </div></header>
 <nav aria-label="Sections">
@@ -104,11 +104,13 @@ footer{max-width:960px;margin:0 auto;padding:0 16px 32px;color:var(--muted);font
   <h3>One click (recommended)</h3>
   <ol>
     <li>Double-click <b>Install-MasterAgent.cmd</b> in the Akzo-Agent folder.</li>
-    <li>Click <b>Add repository…</b> and choose your local clone (a folder with <code>.git</code>). Repeat for each repository.</li>
-    <li>Click <b>Install / Upgrade</b>. The log shows every file written, backed up, or removed, and ends with <code>== Install finished OK ==</code>.</li>
+    <li>Click <b>Add Repository…</b>, type or paste the path of your local clone (Ctrl+V; quotes from File Explorer's <i>Copy as path</i> are removed; spaces and <code>\\server\share</code> paths work) or click <b>Browse…</b>, then <b>Validate</b> and <b>Save</b>. The name is suggested from the folder. Repeat for each repository.</li>
+    <li>Click <b>Install / Upgrade</b>. The log shows every file written, backed up, or removed, and ends with <code>== Install finished OK ==</code>; the <b>Agent Installation Status</b> panel then shows each check.</li>
     <li>Restart VS Code / Visual Studio 2026.</li>
   </ol>
-  <p>The same window has <b>Repair</b> (restore missing or edited files, clean leaked Akzo text from Copilot memory), <b>Verify</b>, and <b>Uninstall</b>. Install is idempotent: running it again never creates a second agent. If a write fails, every file changed in that run is restored (rollback).</p>
+  <p>The same window has <b>Repair</b> (restore missing or edited files, clean leaked Akzo text from Copilot memory; it then lists what is still unresolved), <b>Verify Installation</b>, and <b>Uninstall</b>. Install and Repair are idempotent: running them again never creates a second agent. If a write fails, every file changed in that run is restored (rollback).</p>
+  <p><b>Repositories table</b> (name, path, validation, agent status): <b>Edit…</b> (or double-click / Enter) changes the name or path, <b>Remove</b> (or Delete) asks first and removes only the registration, <b>Open in Explorer</b>, <b>Validate</b>, <b>Refresh</b>. Changes are saved to <code>repos.json</code> at once (backed up first). The folder, its Git repository, and your files are never deleted. Changing a repository's path, or removing it, withdraws the authorization you recorded for it, so the agent asks again for the new folder. A folder that is not a Git repository can be saved after a warning, but the agent works only on Git clones.</p>
+  <p><b>Agent Installation Status</b> shows Verified, Warning, Failed, Not Applicable, or Not Checked for: agent files, agent metadata (front matter a strict YAML parser accepts), VS Code and Visual Studio configuration (the installed IDE versions and settings), old-version conflicts, helper and skills, repositories, version consistency, and configuration integrity. <b>Whether the agent appears in the IDE's picker is always Not Checked</b>: it cannot be read from outside the IDE, so the panel gives the manual steps.</p>
   <h3>From PowerShell</h3>
   <p>Open PowerShell in the <b>Akzo-Agent</b> folder (the folder that contains <code>scripts\install.ps1</code>). No downloads happen; files are copied from this folder.</p>
   <h3>1. Preview</h3>
@@ -120,7 +122,16 @@ footer{max-width:960px;margin:0 auto;padding:0 16px 32px;color:var(--muted);font
   <p>Writes the agent to both user agent folders, the helper and templates to <code>%USERPROFILE%\.akzo-agent\modules</code>, creates <code>%USERPROFILE%\.akzo-agent\repos.json</code> if it does not exist, and creates the tasks folder where refined PBIs go (it prints the exact path). It validates <code>repos.json</code> and changes it only for <b>Add repository</b> / <code>-AddRepo</code> (backed up first); it stops without changes if the file is not valid JSON. Any file it replaces is backed up first to <code>%USERPROFILE%\.akzo-agent\backups\&lt;timestamp&gt;\</code>. Safe to re-run.</p>
   <h3>3. Verify the files</h3>
   <div class="cmd"><pre>powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Verify</pre></div>
-  <p class="muted">Checks installed files against the SHA-256 manifest, checks that no Akzo skill sits in a shared skill folder, and lists registered repositories. It cannot check the IDE's agent picker; do that in the IDE sections below.</p>
+  <p class="muted">Checks installed files against the SHA-256 manifest, checks that no Akzo skill sits in a shared skill folder, and lists registered repositories. It ends with one <code>CHECK [status] name: detail</code> line per item (the setup window shows them). It cannot check the IDE's agent picker; do that in the IDE sections below.</p>
+  <h3>Agent not in the Copilot agent picker</h3>
+  <ol>
+    <li>Run <b>Verify Installation</b> and fix every <b>Failed</b> row; each names its fix.</li>
+    <li><b>VS Code:</b> the agent is read from <code>%USERPROFILE%\.copilot\agents</code> (default of <code>chat.agentFilesLocations</code> in the VS Code builds the check finds). Reload the window, then <b>Ctrl+Shift+P &gt; Configure Custom Agents…</b> lists every agent VS Code found. A user setting that turns <code>~/.copilot/agents</code> off, or <code>chat.disableAIFeatures</code>, hides it.</li>
+    <li><b>Visual Studio:</b> 2022 (17.x) has no custom agents; 2026 reads <code>%USERPROFILE%\.github\agents</code> from 18.5. The <code>.github\agents</code> copy is for Visual Studio only; VS Code reads <code>.github/agents</code> only inside an open workspace.</li>
+    <li>Agents are per user: nothing needs to be installed into each repository. Install as the Windows user who runs the IDE.</li>
+    <li>An organization Copilot policy can turn custom agents off; ask your administrator if the files and settings are verified and the agent is still missing.</li>
+  </ol>
+  <p class="muted"><code>package integrity: NOT VERIFIED - development working copy</code> means the files came from a Git clone or a source download, which has no <code>release-manifest.json</code>. Install from the release zip (<code>release\&lt;version&gt;-rc1\</code>) to have every file checked against the release manifest before anything is written.</p>
   <p class="muted">Upgrading from 2.x: the second agent <code>akzo-sdd</code> is removed (from the manifest, or when an Akzo agent file of that name is found without one), after a backup. A file of that name with other content is left alone.</p>
   <p class="muted">If an earlier version put <code>akzo-*</code> skills in <code>%USERPROFILE%\.copilot\skills</code>, the installer backs them up and removes them.</p>
   <h3>Only one IDE</h3>

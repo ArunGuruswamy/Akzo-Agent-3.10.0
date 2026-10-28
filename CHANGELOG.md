@@ -2,6 +2,25 @@
 
 Akzo SDD Agent — Developed and maintained by Arun RG. The version is in `VERSION`; `install.ps1 -Verify` shows the installed and available versions.
 
+## 3.9.0 — 2026-10-28
+Setup: repository management, installation status, and agent discovery. No application source and no SDD workflow, skill, or profile changed.
+
+**Root cause found (agent not in the picker)**
+- 3.8.0 added `Small work stays small: Fix Issue...` to the agent's unquoted `description`. A `: ` inside a plain YAML value is a syntax error for a strict YAML parser. VS Code's own front-matter parser (taken from the installed 1.143.1) accepts it, so VS Code is not affected; Visual Studio's parser is not documented, so this is a likely but NOT VERIFIED cause there. Fixed (` - `), and a test keeps the value free of `: ` and ` #`.
+- Checked on the installed products, not assumed: VS Code 1.143.1 reads user agents from `~/.copilot/agents` (default `chat.agentFilesLocations`: `.github/agents`, `.claude/agents`, `~/.copilot/agents`); `.github/agents` is workspace-relative, so the `%USERPROFILE%\.github\agents` copy serves Visual Studio only. Visual Studio 2022 17.14 has no custom agents (no `.agent.md` support in its Copilot binaries). Visual Studio 2026 18.5+ was not available here.
+- Other causes the status panel now reports with their fix: an old VS Code build without `~/.copilot/agents`, a user setting that turns it off, `chat.disableAIFeatures`, Visual Studio older than 18.5, a duplicate agent in another discovery folder, installing for another Windows user.
+
+**Setup window** (`Install-MasterAgent.ps1`, same engine)
+- Resizable. Repositories table (name, path, validation, agent status; tooltips, keyboard, double-click) with Add, Edit, Remove, Open in Explorer, Validate, Refresh. Add/Edit dialog: name suggested from the folder; path typed, pasted (quotes removed, spaces, UNC) or browsed; Browse, Validate, Save, Cancel. Saved at once; nothing changes until Save succeeds.
+- Agent Installation Status panel: Verified / Warning / Failed / Not Applicable / Not Checked per check. IDE picker visibility is always Not Checked, with manual steps. Install and Repair run Verify afterwards and list what is still unresolved.
+
+**Engine** (`install.ps1`)
+- `-ValidateRepo`, `-ListRepos` (JSON), `-EditRepo -RepoPath -RepoName`, `-RemoveRepo`, `-AddRepo ... -RepoName -RegistryOnly`. Paths are kept as given (a subfolder is no longer swapped for the repository root); duplicates are found after normalization; missing, relative, malformed, and unreadable folders are refused; a folder that is not a Git clone is registered with a warning. Remove and path edits withdraw the developer authorization recorded for that id (backed up), so it cannot carry over to another folder; the folder, task files, and architecture map are kept.
+- `-Verify` prints `CHECK [status] name: detail` lines; `-VSCodeInstallDir` for tests.
+- Package integrity: a working copy is reported as `NOT VERIFIED - development working copy`; a release manifest for another version is refused; the install manifest records which (`package`).
+
+**Tests:** `scripts\test.ps1` gains checks for pasted and quoted paths, invalid and unreadable folders, duplicates, several repositories, edit, remove without deleting source, persistence, old entries without a name, the status lines, old VS Code builds and settings, duplicate agents, invalid metadata and version mismatch, repeated repair, and release-manifest version. 357 checks pass. `test-gui.ps1` (14 checks pass) clicks *Verify Installation* and saves a pasted, quoted path through the real Add Repository dialog.
+
 ## 3.8.0 — 2026-10-28
 Fast task routing, minimal context, and evidence-based fixes. Akzo SDD PBI Builder was not changed; no application source was changed.
 

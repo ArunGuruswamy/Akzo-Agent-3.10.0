@@ -2,7 +2,7 @@
 .SYNOPSIS
   GUI self-test: drives the real windows through Windows UI Automation in an isolated temporary profile.
   1. Start-Development.cmd -> the file dialog opens, a .docx is chosen, the PBI lands in the inbox, the result box is closed.
-  2. Install-MasterAgent.cmd -> the setup window opens, "Verify" is clicked, VERIFY OK appears in its log.
+  2. Install-MasterAgent.cmd -> the setup window opens, "Verify Installation" is clicked, VERIFY OK appears in its log.
   3. Uninstall-MasterAgent.cmd -> the confirmation is answered "Yes", the agent is removed.
   Needs an interactive desktop session. Exit code 0 = all assertions passed. Never touches the real profile.
 .NOTES
@@ -130,13 +130,29 @@ try {
     $win = Find-Window 'Akzo Master SDD Agent * - Setup'
     Check ([bool]$win) 'Install-MasterAgent.cmd opens the setup window'
     if ($win) {
-        Invoke-ChildButton $win 'Verify'
+        Invoke-ChildButton $win 'Verify Installation'
         $deadline = (Get-Date).AddSeconds(60); $log = ''
         while ((Get-Date) -lt $deadline -and $log -notmatch '== Verify') {
             Start-Sleep -Milliseconds 500
             $log = Get-EditText $win
         }
         Check ($log -match 'VERIFY OK' -and $log -match '== Verify finished OK ==') 'setup window: Verify button runs the check and shows VERIFY OK'
+        # Add Repository: a path pasted with quotes and spaces is saved at once, with the name suggested from the folder.
+        $clone = Join-Path $tmp 'My Clone'; New-Item -ItemType Directory -Force $clone | Out-Null; & git -C $clone init -q
+        Invoke-ChildButton $win 'Add Repository...'
+        $add = $null   # an owned dialog: UI Automation lists it under the setup window
+        for ($i = 0; $i -lt 40 -and -not $add; $i++) { Start-Sleep -Milliseconds 500; $add = Find-In -parent $win -prop 'NameProperty' -value 'Add repository' }
+        if ($add) {
+            $edits = @(); $h = [IntPtr]::Zero
+            while (($h = [AkzoWin]::FindWindowEx([IntPtr]$add.Current.NativeWindowHandle, $h, [NullString]::Value, [NullString]::Value)) -ne [IntPtr]::Zero) {
+                $cls = New-Object Text.StringBuilder 256; [void][AkzoWin]::GetClassName($h, $cls, 256); if ($cls.ToString() -match 'EDIT') { $edits += $h }
+            }
+            [void][AkzoWin]::SendMessage($edits[1], 0x000C, [IntPtr]::Zero, "`"$clone`"")   # WM_SETTEXT on the path box, as pasted
+            Invoke-ChildButton $add 'Save'
+            $deadline = (Get-Date).AddSeconds(30); $saved = $null
+            while ((Get-Date) -lt $deadline -and -not $saved) { Start-Sleep -Milliseconds 500; $saved = try { @((Get-Content (Join-Path $home2 '.akzo-agent\repos.json') -Raw | ConvertFrom-Json).repos | Where-Object { $_.path -eq $clone }) | Select-Object -First 1 } catch { $null } }
+            Check ($saved -and $saved.name -eq 'My Clone') 'setup window: Add Repository saves a pasted, quoted path with the suggested name'
+        } else { Check $false 'setup window: Add Repository opens its dialog' }
         Invoke-ChildButton $win 'Close'
     }
 

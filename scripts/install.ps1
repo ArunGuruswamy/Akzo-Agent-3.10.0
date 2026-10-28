@@ -47,10 +47,21 @@ param(
     # Adds a marked block to VS Code user settings: auto-approve for the exact helper command line, and
     # read access to the Akzo folders. Backed up first; refreshed on reruns; removed by -Uninstall.
     [switch]$ConfigureVSCode,
-    # Registers these local Git repositories in repos.json (idempotent; repos.json is backed up first).
+    # Registers these local repositories in repos.json (idempotent; repos.json is backed up first).
     [string[]]$AddRepo,
     # Backs up and removes VS Code Copilot memory files that mention Akzo (they are loaded for every agent).
-    [switch]$CleanMemory
+    [switch]$CleanMemory,
+    # Repository management (setup window). With -RegistryOnly, -AddRepo only registers (no install).
+    # Source folders are never written or deleted; repos.json is backed up before every change.
+    [string]$ValidateRepo,      # prints the validation as JSON; writes nothing
+    [string]$RepoName,          # display name for -AddRepo (one path) or -EditRepo
+    [string]$EditRepo,          # repository id to change (-RepoName, -RepoPath)
+    [string]$RepoPath,
+    [string]$RemoveRepo,        # repository id: removes its registration only
+    [switch]$ListRepos,         # prints the registered repositories with their validation as JSON
+    [switch]$RegistryOnly,
+    # Tests: check this VS Code installation folder instead of the detected ones.
+    [string]$VSCodeInstallDir
 )
 $ErrorActionPreference = 'Stop'
 
@@ -82,8 +93,13 @@ if (Test-Path $ReleaseManifest) {
         $rel = $f.FullName.Substring($Source.Length + 1); if (-not $listed.ContainsKey($rel)) { $bad += "not in the release manifest $rel" }
     }
     if ($bad) { throw "PACKAGE INTEGRITY FAILED ($ReleaseManifest, version $($rm.version)): $($bad -join '; '). Do not install this package; get it again from the trusted source." }
+    if ($rm.version -ne $SourceVersion) { throw "PACKAGE INTEGRITY FAILED: release-manifest.json is for version $($rm.version), VERSION says $SourceVersion." }
+    $PackageStatus = "release package $($rm.version): $(@($rm.files).Count) file(s) match release-manifest.json"
     Write-Output "package integrity OK: $(@($rm.files).Count) file(s) match release-manifest.json (version $($rm.version))"
-} else { Write-Output 'package integrity: no release-manifest.json (working copy, not a release package)' }
+} else {
+    $PackageStatus = 'working copy'
+    Write-Output 'package integrity: NOT VERIFIED - development working copy (no release-manifest.json). Release zips from scripts\make-release.ps1 carry one; install from such a zip to have the files checked.'
+}
 # Folders Copilot scans for skills/instructions for every agent (VS Code source + docs, Visual Studio docs).
 $SharedSkillDirs = '.copilot\skills', '.agents\skills', '.claude\skills' | ForEach-Object { Join-Path $HomeRoot $_ }
 $VSCodeUserDirs = 'Code', 'Code - Insiders' | ForEach-Object { Join-Path $HomeRoot "AppData\Roaming\$_\User" }
@@ -141,21 +157,99 @@ function Get-LegacyAgentFile {
     }
 }
 
-# Adds a local Git repository to repos.json. specsDir follows a spec folder the repository already has.
-function Add-Repository([string]$repoPath) {
-    $top = if (Test-Path -LiteralPath $repoPath -PathType Container) { try { (& git -C $repoPath rev-parse --show-toplevel 2>$null) } catch { '' } }
-    if (-not $top) { Write-Output "skip    AddRepo '$repoPath': not a Git repository; not registered."; return }
-    $full = (Resolve-Path -LiteralPath $top).Path
+# A path as typed or pasted (File Explorer address bar, "Copy as path"): trimmed, surrounding quotes dropped, %VARS%
+# expanded, '..' and '/' resolved. '' unless it is a full local (C:\...) or UNC (\\server\share\...) path.
+function ConvertTo-RepoPath([string]$p) {
+    $p = "$p".Trim()
+    if ($p.Length -ge 2 -and $p[0] -eq $p[$p.Length - 1] -and "$($p[0])" -in '"', "'") { $p = $p.Substring(1, $p.Length - 2).Trim() }
+    $p = [Environment]::ExpandEnvironmentVariables($p)
+    if ($p -notmatch '^([A-Za-z]:[\\/]|\\\\[^\\/]+[\\/][^\\/]+)' -or $p.IndexOfAny([IO.Path]::GetInvalidPathChars()) -ge 0) { return '' }
+    try { $full = [IO.Path]::GetFullPath($p) } catch { return '' }
+    if ($full.Length -gt 3) { $full = $full.TrimEnd('\') }
+    $full
+}
+
+# Validation shown before a repository is saved. Invalid blocks saving; Warning needs the user's confirmation.
+function Test-RepoPath([string]$given, [string]$exceptId = '') {
+    $full = ConvertTo-RepoPath $given
+    $v = [ordered]@{ input = "$given"; path = $full; name = ''; status = 'Invalid'; git = $false; gitTop = ''; duplicateOf = ''; message = '' }
+    if (-not $full) { $v.message = 'Enter a full folder path, for example C:\src\backend or \\server\share\backend.'; return [pscustomobject]$v }
+    $v.name = Split-Path $full -Leaf
+    if (-not (Test-Path -LiteralPath $full -PathType Container)) { $v.message = "Folder not found (or not reachable): $full."; return [pscustomobject]$v }
+    try { $null = @(Get-ChildItem -LiteralPath $full -Force -ErrorAction Stop | Select-Object -First 1) } catch { $v.message = "Folder not accessible: $($_.Exception.Message)"; return [pscustomobject]$v }
+    $dup = @((Read-Config).repos | Where-Object { $_ -and $_.id -ne $exceptId -and $_.path -and (ConvertTo-RepoPath $_.path) -eq $full }) | Select-Object -First 1
+    if ($dup) { $v.duplicateOf = "$($dup.id)"; $v.message = "Already registered as '$($dup.id)'."; return [pscustomobject]$v }
+    if (Test-Path -LiteralPath (Join-Path $full '.git')) { $v.status = 'Valid'; $v.git = $true; $v.message = 'Git repository.'; return [pscustomobject]$v }
+    $top = try { & git -C $full rev-parse --show-toplevel 2>$null } catch { '' }
+    $v.status = 'Warning'
+    if ($top) { $v.gitTop = "$top" -replace '/', '\'; $v.message = "Inside the Git repository $($v.gitTop); the agent works on that whole repository." }
+    else { $v.message = 'Not a Git repository. It can be registered, but the agent needs a Git clone for its branch, change, and review checks and refuses this folder until it is one.' }
+    [pscustomobject]$v
+}
+
+function Save-Registry($cfg) {
+    if (Test-Path -LiteralPath $Registry) { Backup $Registry }
+    if (-not $DryRun) { New-Item -ItemType Directory -Force -Path $AkzoHome | Out-Null; [IO.File]::WriteAllText($Registry, ($cfg | ConvertTo-Json -Depth 6), $Utf8) }
+}
+
+# The developer's recorded G8 statement is keyed by repository id; it must not carry over to another folder.
+function Remove-Attestation([string]$id) {
+    $auth = Join-Path $AkzoHome 'authorizations.json'
+    $data = try { Get-Content -LiteralPath $auth -Raw -ErrorAction Stop | ConvertFrom-Json } catch { $null }
+    if (-not $data.repos -or -not $data.repos.PSObject.Properties[$id]) { return }
+    Backup $auth
+    $data.repos.PSObject.Properties.Remove($id)
+    Say "revoke  developer authorization recorded for '$id' (it applied to the previous folder; the agent asks again on first use)"
+    if (-not $DryRun) { [IO.File]::WriteAllText($auth, ($data | ConvertTo-Json -Depth 6), $Utf8) }
+}
+
+function Edit-Repository([string]$id, [string]$newPath, [string]$newName) {
     $cfg = Read-Config
-    if (-not $cfg) { $cfg = Get-Content (Join-Path $Source 'config\repos.example.json') -Raw | ConvertFrom-Json }   # dry run before the registry exists
-    $repos = @($cfg.repos | Where-Object { $_ })
-    $same = $repos | Where-Object { (Test-GitRepo $_.path) -and (Resolve-Path -LiteralPath $_.path).Path -eq $full } | Select-Object -First 1
-    if ($same) {
+    $e = @($cfg.repos | Where-Object { $_ -and $_.id -eq $id }) | Select-Object -First 1
+    if (-not $e) { Write-Output "NOT SAVED: no repository '$id' in $Registry."; $script:RegistryFailed = $true; return }
+    $moved = $false
+    if ($newPath) {
+        $v = Test-RepoPath $newPath $id
+        if ($v.status -eq 'Invalid') { Write-Output "NOT SAVED: $($v.message)"; $script:RegistryFailed = $true; return }
+        $moved = (ConvertTo-RepoPath $e.path) -ne $v.path
+        if ($moved) { $e.path = $v.path }
+    }
+    $renamed = $newName -and $newName.Trim() -ne "$($e.name)"
+    if ($renamed) { $e | Add-Member -NotePropertyName name -NotePropertyValue $newName.Trim() -Force }
+    if (-not ($moved -or $renamed)) { Say "keep    repository '$id' (no change)"; return }
+    Save-Registry $cfg
+    Say "update  repository '$id'$(if ($renamed) { " name '$($e.name)'" })$(if ($moved) { " -> $($e.path)" })"
+    if ($moved) { Remove-Attestation $id }
+}
+
+function Remove-Repository([string]$id) {
+    $cfg = Read-Config
+    $e = @($cfg.repos | Where-Object { $_ -and $_.id -eq $id }) | Select-Object -First 1
+    if (-not $e) { Write-Output "NOT REMOVED: no repository '$id' in $Registry."; $script:RegistryFailed = $true; return }
+    $cfg.repos = @($cfg.repos | Where-Object { $_ -and $_.id -ne $id })
+    Save-Registry $cfg
+    Say "remove  repository '$id' registration (the folder $($e.path) is not touched)"
+    Remove-Attestation $id
+    foreach ($d in @((Join-Path (Get-TasksDir $cfg) $id), (Join-Path $AkzoHome "maps\$id")) | Where-Object { Test-Path -LiteralPath $_ }) { Say "keep    $d (task files or architecture map; delete it yourself if no longer needed)" }
+}
+
+# Adds a local repository to repos.json as given (never swapped for another folder). specsDir follows a spec folder it already has.
+function Add-Repository([string]$repoPath, [string]$name = '') {
+    $v = Test-RepoPath $repoPath
+    if ($v.duplicateOf) {
+        $full = $v.path; $same = @((Read-Config).repos | Where-Object { $_ -and $_.id -eq $v.duplicateOf })[0]
         Say "keep    repository '$($same.id)' -> $full (already registered)"
         if (-not $DryRun -and -not (Test-Path (Join-Path $AkzoHome "maps\$($same.id)\architecture.json"))) { Invoke-Discovery $same.id }   # e.g. after its authorization
         return
     }
-    $base = ((Split-Path $full -Leaf) -replace '[^A-Za-z0-9._-]', '-').Trim('-', '.')
+    if ($v.status -eq 'Invalid') { Write-Output "skip    AddRepo '$repoPath': $($v.message) Not registered."; $script:RegistryFailed = $true; return }
+    if ($v.status -eq 'Warning') { Write-Warning "AddRepo '$($v.path)': $($v.message)" }
+    $full = $v.path
+    $cfg = Read-Config
+    if (-not $cfg) { $cfg = Get-Content (Join-Path $Source 'config\repos.example.json') -Raw | ConvertFrom-Json }   # before the registry exists
+    $repos = @($cfg.repos | Where-Object { $_ })
+    $name = "$name".Trim()
+    $base = ($(if ($name) { $name } else { Split-Path $full -Leaf }) -replace '[^A-Za-z0-9._-]', '-').Trim('-', '.')
     if (-not $base) { $base = 'repo' }
     $id = $base
     for ($n = 2; $repos.id -contains $id; $n++) { $id = "$base-$n" }
@@ -163,16 +257,13 @@ function Add-Repository([string]$repoPath) {
     $stack = @()
     if (Get-ChildItem -LiteralPath $full -Filter *.sln -Recurse -Depth 2 -ErrorAction SilentlyContinue | Select-Object -First 1) { $stack += 'dotnet' }
     if (Get-ChildItem -LiteralPath $full -Filter angular.json -Recurse -Depth 2 -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notmatch '\\node_modules\\' } | Select-Object -First 1) { $stack += 'angular' }
-    $entry = [pscustomobject]@{ id = $id; path = $full; specsDir = "$specsDir"; purpose = ''; stack = $stack; notes = @(); commands = [pscustomobject]@{ build = ''; test = ''; codegen = ''; lint = '' }; verified = [pscustomobject]@{ date = ''; commit = '' } }
+    $entry = [pscustomobject]@{ id = $id; name = $(if ($name) { $name } else { Split-Path $full -Leaf }); path = $full; specsDir = "$specsDir"; purpose = ''; stack = $stack; notes = @(); commands = [pscustomobject]@{ build = ''; test = ''; codegen = ''; lint = '' }; verified = [pscustomobject]@{ date = ''; commit = '' } }
     # Unconfigured example entries (no path, never verified) would only show up as choices that cannot work.
     $kept = @($repos | Where-Object { $_.path -or $_.verified.date })
     $cfg.repos = @($kept) + $entry
-    Backup $Registry
+    Save-Registry $cfg
     Say "add     repository '$id' -> $full$(if ($specsDir) { " (specsDir $specsDir)" })"
-    if (-not $DryRun) {
-        [IO.File]::WriteAllText($Registry, ($cfg | ConvertTo-Json -Depth 6), $Utf8)
-        Invoke-Discovery $id
-    }
+    if (-not $DryRun) { Invoke-Discovery $id }
 }
 
 # First architecture discovery of a newly registered repository (the helper refreshes it later only when HEAD moves).
@@ -332,6 +423,65 @@ function Remove-EmptyAkzoDirectory {
         ForEach-Object { Remove-EmptyDirectory -Root $_.FullName }
 }
 
+# Front matter as a strict YAML parser reads it (Visual Studio's parser is not documented; VS Code's is lenient).
+function Test-AgentFrontMatter([string]$text, [string]$fileName) {
+    if ($text -notmatch '(?s)^﻿?---\r?\n(.*?)\r?\n---\r?\n') { return @('no front matter (--- ... ---) at the top') }
+    $keys = @{}
+    foreach ($line in $Matches[1] -split '\r?\n' | Where-Object { $_.Trim() }) {
+        if ($line -notmatch '^([A-Za-z][\w-]*):(?:\s+(.*))?$') { "line is not 'key: value': $line"; continue }
+        $k = $Matches[1]; $val = "$($Matches[2])".Trim(); $keys[$k] = $val
+        if ($val -match '^"') { if ($val -notmatch '^"(?:[^"\\]|\\.)*"$') { "${k}: unterminated double-quoted value" } }
+        elseif ($val -match "^'") { if ($val -notmatch "^'(?:[^']|'')*'$") { "${k}: unterminated single-quoted value" } }
+        elseif ($val -match ': |\s#|^[\[\]{}&*!|>%@`]') { "${k}: plain value contains ': ', ' #', or starts with a YAML indicator; quote it" }
+    }
+    $base = $fileName -replace '\.agent\.md$', ''
+    if (-not $keys['name']) { 'name is missing' } elseif ($keys['name'].Trim('"', "'") -ne $base) { "name '$($keys['name'])' differs from the file name '$base'" }
+    if (-not $keys['description']) { 'description is missing' }
+}
+
+# VS Code installations: version, and whether that build reads user-level agents from ~/.copilot/agents by default.
+function Get-VSCodeInstall {
+    $dirs = if ($VSCodeInstallDir) { @($VSCodeInstallDir) } else {
+        @("$env:LOCALAPPDATA\Programs\Microsoft VS Code", "$env:ProgramFiles\Microsoft VS Code", "$env:LOCALAPPDATA\Programs\Microsoft VS Code Insiders", "$env:ProgramFiles\Microsoft VS Code Insiders")
+    }
+    foreach ($d in $dirs | Where-Object { $_ -and (Test-Path -LiteralPath $_) }) {
+        $app = @(Get-Item -LiteralPath (Join-Path $d 'resources\app') -ErrorAction SilentlyContinue) + @(Get-ChildItem -LiteralPath $d -Directory -ErrorAction SilentlyContinue | ForEach-Object { Get-Item -LiteralPath (Join-Path $_.FullName 'resources\app') -ErrorAction SilentlyContinue }) |
+            Where-Object { $_ } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        if (-not $app) { continue }
+        $version = try { (Get-Content -LiteralPath (Join-Path $app.FullName 'package.json') -Raw | ConvertFrom-Json).version } catch { 'unknown' }
+        $wb = Join-Path $app.FullName 'out\vs\workbench\workbench.desktop.main.js'
+        $reads = if (Test-Path -LiteralPath $wb) { [IO.File]::ReadAllText($wb).Contains('"~/.copilot/agents"') } else { $null }
+        [pscustomobject]@{ dir = $d; version = "$version"; readsUserAgents = $reads }
+    }
+}
+
+# ---------------------------------------------------------------- repository registry (setup window)
+if ($PSBoundParameters.ContainsKey('ValidateRepo') -or $ListRepos -or $EditRepo -or $RemoveRepo -or ($RegistryOnly -and $AddRepo)) {
+    try { $null = Read-Config } catch { Write-Output "NOT SAVED: repos.json is not valid JSON ($Registry): $($_.Exception.Message)"; exit 2 }
+    if ($PSBoundParameters.ContainsKey('ValidateRepo')) { $v = Test-RepoPath $ValidateRepo $EditRepo; $v | ConvertTo-Json; exit $(if ($v.status -eq 'Invalid') { 1 } else { 0 }) }
+    if ($ListRepos) {
+        $installed = Test-Path $ManifestPath
+        $auth = try { (Get-Content -LiteralPath (Join-Path $AkzoHome 'authorizations.json') -Raw -ErrorAction Stop | ConvertFrom-Json).repos } catch { $null }
+        $list = foreach ($r in @((Read-Config).repos | Where-Object { $_ })) {
+            $v = Test-RepoPath $r.path $r.id
+            $agent = if (-not $installed) { 'Agent not installed' } else {
+                'Registered' + $(if (Test-Path (Join-Path $AkzoHome "maps\$($r.id)\architecture.json")) { '; map built' } else { '; map not built yet' }) +
+                $(if ($auth -and $auth.PSObject.Properties[$r.id]) { '; authorization recorded' } else { '; authorization asked on first use' })
+            }
+            [pscustomobject]@{ id = "$($r.id)"; name = $(if ($r.name) { "$($r.name)" } else { "$($r.id)" }); path = "$($r.path)"; validation = $v.status; message = $v.message; agentStatus = $agent }
+        }
+        ConvertTo-Json -InputObject @($list) -Depth 3; exit 0
+    }
+    $RegistryFailed = $false
+    if ($EditRepo) { Edit-Repository $EditRepo $RepoPath $RepoName }
+    elseif ($RemoveRepo) { Remove-Repository $RemoveRepo }
+    else {
+        $paths = @($AddRepo | ForEach-Object { $_ -split ';' } | Where-Object { $_.Trim() })
+        foreach ($p in $paths) { Add-Repository $p.Trim() $(if ($paths.Count -eq 1) { $RepoName }) }
+    }
+    exit $(if ($RegistryFailed) { 2 } else { 0 })
+}
+
 # ---------------------------------------------------------------- verify
 if ($Verify) {
     $problems = 0
@@ -403,6 +553,79 @@ if ($Verify) {
             else { Write-Output "MISSING   tasks folder $tasks. Run install.ps1 to create it."; $problems++ }
         }
     } else { Write-Output "NO REGISTRY at $Registry"; $problems++ }
+
+    # Installation status, one line per check (the setup window shows these). Files on disk and IDE settings are checked;
+    # whether the IDE's agent picker lists the agent cannot be read from outside the IDE, so it stays 'Not Checked'.
+    $checks = New-Object Collections.ArrayList
+    $add = { param($status, $name, $detail) [void]$checks.Add("CHECK [$status] ${name}: $detail") }
+    $agentFiles = @($manifest | Where-Object { $_.path -like '*.agent.md' })
+    $absent = @($agentFiles | Where-Object { -not (Test-Path $_.path) })
+    if (-not $agentFiles.Count) { & $add 'Failed' 'Agent file existence' 'no agent file in the install manifest; run Repair.' }
+    elseif ($absent.Count) { & $add 'Failed' 'Agent file existence' "missing: $(@($absent.path) -join ', '). Run Repair." }
+    else { & $add 'Verified' 'Agent file existence' (@($agentFiles.path) -join '; ') }
+    $meta = @(foreach ($f in $agentFiles | Where-Object { Test-Path $_.path }) { foreach ($p in @(Test-AgentFrontMatter ([IO.File]::ReadAllText($f.path)) (Split-Path $f.path -Leaf))) { "$($f.path): $p" } })
+    if ($meta.Count) { & $add 'Failed' 'Agent metadata validity' (($meta -join '; ') + '. Run Repair; if it persists, the package is damaged.') }
+    elseif ($agentFiles.Count -gt $absent.Count) { & $add 'Verified' 'Agent metadata validity' 'front matter parses as strict YAML; name matches the file name; description present.' }
+    else { & $add 'Not Checked' 'Agent metadata validity' 'no agent file to read.' }
+    $vsc = @($agentFiles | Where-Object { $_.path -like (Join-Path $HomeRoot '.copilot\agents\*') })
+    if ($Target -notin 'All', 'VSCode') { & $add 'Not Applicable' 'VS Code agent configuration' "installed for target '$Target' only." }
+    else {
+        $codes = @(Get-VSCodeInstall)
+        $settingsText = if (Test-Path $VSCodeSettings) { [IO.File]::ReadAllText($VSCodeSettings) } else { '' }
+        $where = 'user-level agent folder ~/.copilot/agents (VS Code default for chat.agentFilesLocations)'
+        if (-not $vsc.Count -or @($vsc | Where-Object { -not (Test-Path $_.path) }).Count) { & $add 'Failed' 'VS Code agent configuration' "the agent file is not in the $where. Run Repair." }
+        elseif ($settingsText -match '"chat\.disableAIFeatures"\s*:\s*true') { & $add 'Failed' 'VS Code agent configuration' "chat.disableAIFeatures is true in $VSCodeSettings; Copilot Chat and its agents are hidden. Set it to false." }
+        elseif ($settingsText -match '"~/\.copilot/agents"\s*:\s*false') { & $add 'Failed' 'VS Code agent configuration' "chat.agentFilesLocations turns ~/.copilot/agents off in $VSCodeSettings. Set it to true." }
+        elseif (-not $codes.Count) { & $add 'Not Applicable' 'VS Code agent configuration' 'VS Code not found in the usual install folders; the agent file is in place for it.' }
+        elseif (-not @($codes | Where-Object { $_.readsUserAgents }).Count) { & $add 'Failed' 'VS Code agent configuration' "VS Code $(@($codes.version) -join ', ') does not list ~/.copilot/agents as an agent folder. Update VS Code (Help > Check for Updates), then reload." }
+        else {
+            $note = if ($settingsText -match '"chat\.agentFilesLocations"' -and $settingsText -notmatch '"~/\.copilot/agents"') { " Note: $VSCodeSettings sets chat.agentFilesLocations without ~/.copilot/agents; add `"~/.copilot/agents`": true if the agent is missing." } else { '' }
+            & $add $(if ($note) { 'Warning' } else { 'Verified' }) 'VS Code agent configuration' ("VS Code $(@($codes | ForEach-Object { "$($_.version)$(if (-not $_.readsUserAgents) { ' (does not read it)' })" }) -join ', ') reads the $where; the agent file is there.$note")
+        }
+    }
+    if ($Target -notin 'All', 'VisualStudio') { & $add 'Not Applicable' 'Visual Studio agent configuration' "installed for target '$Target' only." }
+    elseif (-not (Test-Path $vswhere)) { & $add 'Not Applicable' 'Visual Studio agent configuration' 'Visual Studio not installed (no vswhere.exe).' }
+    else {
+        $vsVersions = @(& $vswhere -all -prerelease -property installationVersion 2>$null | Where-Object { $_ })
+        $new = @($vsVersions | Where-Object { [version]$_ -ge [version]'18.5' })
+        $vsFile = Join-Path $VisualStudioAgentsDir 'akzo-master-sdd.agent.md'
+        if (-not $vsVersions.Count) { & $add 'Not Applicable' 'Visual Studio agent configuration' 'no Visual Studio installation found.' }
+        elseif (-not (Test-Path $vsFile)) { & $add 'Failed' 'Visual Studio agent configuration' "$vsFile is missing. Run Repair." }
+        elseif (-not $new.Count) { & $add 'Warning' 'Visual Studio agent configuration' "installed Visual Studio $($vsVersions -join ', ') has no user-level custom agents (Microsoft documents them from Visual Studio 2026 version 18.5). Use VS Code, or update Visual Studio." }
+        else { & $add 'Verified' 'Visual Studio agent configuration' "Visual Studio $($new -join ', '): agent file in $VisualStudioAgentsDir (the default user agent folder; it must match Tools > Options > GitHub > Copilot if you changed it)." }
+    }
+    $twins = @(foreach ($d in @($VSCodeUserDirs | ForEach-Object { Join-Path $_ 'prompts' }) + @((Join-Path $HomeRoot '.claude\agents'))) {
+            Get-ChildItem -LiteralPath $d -Filter *.agent.md -File -ErrorAction SilentlyContinue | Where-Object { [IO.File]::ReadAllText($_.FullName) -match '(?m)^name:\s*["'']?akzo-master-sdd' } | ForEach-Object { $_.FullName } })
+    $legacy = @(Get-LegacyAgentFile)
+    if ($legacy.Count -or $twins.Count) { & $add 'Failed' 'Old-version conflicts' "other Akzo agent files are discovered too: $(@($legacy + $twins) -join ', '). Repair removes earlier agents (backed up); remove copies you placed yourself." }
+    else { & $add 'Verified' 'Old-version conflicts' 'no earlier or duplicate Akzo agent file in the agent folders.' }
+    $helperOk = Test-Path (Join-Path $ModulesDir 'investigate\scripts\akzo.ps1')
+    $profMiss = if (Test-Path $pj) { @($pmiss).Count } else { 1 }
+    if (-not $helperOk -or $profMiss) { & $add 'Failed' 'Supporting scripts and skills' "$(if (-not $helperOk) { 'helper akzo.ps1 missing; ' })$profMiss profile file(s) missing. Run Repair." }
+    else { & $add 'Verified' 'Supporting scripts and skills' "helper and $(@($plist).Count) profile skill/rule file(s) present in $ModulesDir." }
+    $regs = @(if (Test-Path $Registry) { try { @((Read-Config).repos | Where-Object { $_ -and $_.path }) } catch { } })
+    $badRegs = @($regs | Where-Object { (Test-RepoPath $_.path $_.id).status -ne 'Valid' })
+    if (-not (Test-Path $Registry)) { & $add 'Failed' 'Registered repositories' "no $Registry. Run Install." }
+    elseif (-not $regs.Count) { & $add 'Warning' 'Registered repositories' 'none yet: add your local clone with Add Repository.' }
+    elseif ($badRegs.Count) { & $add 'Warning' 'Registered repositories' "$($regs.Count) registered; check: $(@($badRegs | ForEach-Object { "$($_.id) ($((Test-RepoPath $_.path $_.id).message))" }) -join '; ')" }
+    else { & $add 'Verified' 'Registered repositories' "$($regs.Count) registered, all found and Git repositories." }
+    & $add 'Not Applicable' 'Repository-specific configuration' 'the agent is installed per user; nothing is written into repositories (their own .github guidance is read, never changed).'
+    $agentVers = @($agentFiles | Where-Object { Test-Path $_.path } | ForEach-Object { if ([IO.File]::ReadAllText($_.path) -match 'Akzo Master SDD Agent v(\d+\.\d+\.\d+)') { $Matches[1] } else { '?' } } | Sort-Object -Unique)
+    $modVer = if (Test-Path (Join-Path $ModulesDir 'VERSION')) { (Get-Content (Join-Path $ModulesDir 'VERSION') -TotalCount 1).Trim() } else { '?' }
+    $vers = "manifest $installedVersion, agent $($agentVers -join '/'), modules $modVer, this folder $SourceVersion"
+    if (@($agentVers + $modVer | Where-Object { $_ -ne $installedVersion }).Count) { & $add 'Failed' 'Installed version consistency' "$vers. Run Repair." }
+    elseif ($installedVersion -ne $SourceVersion) { & $add 'Warning' 'Installed version consistency' "$vers. Run Install / Upgrade from this folder to change to $SourceVersion." }
+    else { & $add 'Verified' 'Installed version consistency' $vers }
+    $broken = @($manifest | Where-Object { -not (Test-Path $_.path) -or (Get-FileSha $_.path) -ne $_.sha256 })
+    $pkg = if ($saved.package) { "; installed from: $($saved.package)" } else { '' }
+    if ($broken.Count) { & $add 'Failed' 'Configuration integrity' "$($broken.Count) of $($manifest.Count) installed file(s) missing or changed since install$pkg. Run Repair." }
+    elseif ($saved.package -eq 'working copy') { & $add 'Warning' 'Configuration integrity' "$($manifest.Count) installed file(s) match the install manifest; installed from a development working copy, so the package itself was not checked against a release manifest." }
+    else { & $add 'Verified' 'Configuration integrity' "$($manifest.Count) installed file(s) match the install manifest$pkg." }
+    if ($HomeRoot -ne $env:USERPROFILE) { & $add 'Warning' 'User profile' "installed for $HomeRoot, but this Windows user's profile is $env:USERPROFILE; the IDE reads the signed-in user's profile." }
+    & $add 'Not Checked' 'Agent visible in the IDE picker' "cannot be read from outside the IDE. VS Code: reload the window (Ctrl+Shift+P > Reload Window), open Chat, and look for 'akzo-master-sdd' in the agent dropdown; if missing, Ctrl+Shift+P > 'Configure Custom Agents...' lists the agents VS Code found. Visual Studio 2026 18.5+: restart it and open the Copilot Chat agent picker. An organization policy can also turn off custom agents."
+    $checks
+    $failed = @($checks -match '^CHECK \[Failed\]').Count
+    if ($failed -and -not $problems) { $problems = $failed }   # failures the file checks above did not already count
     Write-Output $(if ($problems) { "VERIFY FAILED: $problems problem(s)." } else { "VERIFY OK: $($manifest.Count) installed file(s) match the manifest." })
     Write-Output 'Note: this checks files on disk only. Confirm discovery in the IDE agent picker (see installation-guide.html).'
     exit $(if ($problems) { 1 } else { 0 })
@@ -505,7 +728,7 @@ if ($Uninstall) {
         Remove-EmptyAkzoDirectory
         $entries = foreach ($k in $desired.Keys) { [pscustomobject]@{ path = $k; sha256 = Get-Hash $desired[$k] } }
         $commit = try { & git -C $Source rev-parse --short HEAD 2>$null } catch { '' }   # source may be uncommitted
-        [pscustomobject]@{ product = 'Akzo Master SDD Agent'; version = $SourceVersion; maintainer = 'Arun RG'; source = $Source; commit = "$commit"; installedAt = (Get-Date).ToString('o'); target = $Target; visualStudioAgentsDir = $VisualStudioAgentsDir; files = @($entries) } |
+        [pscustomobject]@{ product = 'Akzo Master SDD Agent'; version = $SourceVersion; maintainer = 'Arun RG'; source = $Source; commit = "$commit"; installedAt = (Get-Date).ToString('o'); target = $Target; visualStudioAgentsDir = $VisualStudioAgentsDir; package = $PackageStatus; files = @($entries) } |
             ConvertTo-Json -Depth 4 | Set-Content -Path $ManifestPath -Encoding UTF8
     }
     Say ("Done: {0} written, {1} unchanged, {2} removed." -f $counts.written, $counts.unchanged, $counts.removed)

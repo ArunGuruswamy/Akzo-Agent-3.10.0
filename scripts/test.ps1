@@ -35,6 +35,7 @@ $front = if ($agent -match '(?s)^---\r?\n(.*?)\r?\n---') { $Matches[1] } else { 
 Check ($front -match '(?m)^name:\s*akzo-master-sdd\s*$' -and $front -match '(?m)^description:\s*\S') 'agent frontmatter has name and description'
 Check ($agent -notmatch '(?m)^tools:') 'agent omits tools (tool names differ between VS Code and Visual Studio)'
 Check ($front -match '(?m)^disable-model-invocation:\s*true\s*$') 'agent cannot be invoked as a subagent by other agents (VS Code)'
+Check ($front -match '(?m)^description: [^''"]' -and $front -notmatch '(?m)^description: [^''"].*(: |\s#)') 'agent description is valid strict YAML (no ": " or " #" in the plain value)'
 Check ($agent -match 'never edit, rename, or move them' -and $agent -match 'Never choose an implementation target silently') 'agent: PBI and inputs are read-only and ambiguous targets are asked'
 $phases = '1. Intake', '2. Investigate', '3. Spec', '4. Plan', '5. Implement', '6. Validate', '7. Review and handover'
 Check (@($phases | Where-Object { $agent -match "(?m)^## $([regex]::Escape($_))" }).Count -eq 7) 'agent holds all seven phases itself (no module files to read, no read prompts)'
@@ -224,7 +225,62 @@ try {
     $cfg = Get-Content "$home2\.akzo-agent\repos.json" -Raw | ConvertFrom-Json
     Check ($r.out -match 'already registered' -and @($cfg.repos).Count -eq 2 -and @($cfg.repos | Where-Object { $_.id -eq 'backend' }).Count -eq 1) 'add repo: rerun does not duplicate; several paths joined with ";"'
     $r = PS51 $install -HomeRoot $home2 -AddRepo "$tmp\not-a-repo"
-    Check ($r.code -eq 0 -and $r.out -match 'not a Git repository' -and @((Get-Content "$home2\.akzo-agent\repos.json" -Raw | ConvertFrom-Json).repos).Count -eq 2) 'add repo: a folder that is not a Git repository is refused'
+    Check ($r.code -eq 0 -and $r.out -match 'Folder not found' -and @((Get-Content "$home2\.akzo-agent\repos.json" -Raw | ConvertFrom-Json).repos).Count -eq 2) 'add repo: a folder that does not exist is refused'
+
+    # Repository management (setup window): validate, add, edit, remove. Only repos.json changes; source folders are never touched.
+    function PS51Enc([string]$cmd) {   # passes a value with literal double quotes, as a path pasted from File Explorer has
+        $ErrorActionPreference = 'Continue'
+        $out = & powershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand ([Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($cmd))) 2>&1
+        [pscustomobject]@{ code = $LASTEXITCODE; out = ($out | Out-String) }
+    }
+    function JV($res) { $res.out.Substring([Math]::Max(0, $res.out.IndexOf('{'))) | ConvertFrom-Json }
+    $reg2 = "$home2\.akzo-agent\repos.json"; $man2 = "$home2\.akzo-agent\install-manifest.json"
+    $spaced = Join-Path $tmp 'repos\Color Apps Backend'; $plain = Join-Path $tmp 'repos\plain sources'; $moved = Join-Path $tmp 'repos\moved clone'
+    New-Item -ItemType Directory -Force $spaced, $plain, $moved | Out-Null
+    & git -C $spaced init -q; & git -C $moved init -q
+    Set-Content "$spaced\keep.txt" 'source'; Set-Content "$plain\keep.txt" 'source'
+    $regBefore = Get-Content $reg2 -Raw; $manBefore = Get-Content $man2 -Raw
+    $v1 = JV (PS51 $install -HomeRoot $home2 -ValidateRepo "  '$spaced\'  ")
+    $v2 = JV (PS51Enc "& '$install' -HomeRoot '$home2' -ValidateRepo '`"$spaced`"'")
+    Check ($v1.status -eq 'Valid' -and $v1.path -eq $spaced -and $v1.name -eq 'Color Apps Backend' -and $v2.status -eq 'Valid' -and $v2.path -eq $spaced -and (Get-Content $reg2 -Raw) -eq $regBefore) 'repo validate: a pasted path with quotes, spaces, and a trailing \ is normalized; nothing is written' "$($v1.status) $($v1.path) | $($v2.status) $($v2.path)"
+    $bad = @(foreach ($p in 'relative\folder', 'C:folder', "$tmp\does-not-exist", "$spaced|x") { (JV (PS51 $install -HomeRoot $home2 -ValidateRepo $p)).status })
+    $locked = Join-Path $tmp 'repos\locked'; New-Item -ItemType Directory -Force $locked | Out-Null
+    $me = "$env:USERDOMAIN\$env:USERNAME"
+    try { $null = & icacls $locked /deny "${me}:(RD)"; $vl = JV (PS51 $install -HomeRoot $home2 -ValidateRepo $locked) } finally { $null = & icacls $locked /remove:d $me }
+    Check ((($bad | Select-Object -Unique) -join ',') -eq 'Invalid' -and $vl.status -eq 'Invalid' -and $vl.message -match 'not accessible') 'repo validate: relative, drive-relative, missing, malformed, and unreadable folders are Invalid' "$($bad -join ',') | $($vl.status) $($vl.message)"
+    $r = PS51 $install -HomeRoot $home2 -AddRepo $spaced -RepoName 'ColorApps Backend' -RegistryOnly
+    $r2 = PS51 $install -HomeRoot $home2 -AddRepo $plain -RegistryOnly
+    $cfg = Get-Content $reg2 -Raw | ConvertFrom-Json
+    $cb = @($cfg.repos | Where-Object { $_.id -eq 'ColorApps-Backend' })
+    Check ($r.code -eq 0 -and $cb.Count -eq 1 -and $cb[0].name -eq 'ColorApps Backend' -and $cb[0].path -eq $spaced -and (Get-Content $man2 -Raw) -eq $manBefore) 'repo add: saved at once with its display name, without reinstalling the agent'
+    Check ($r2.code -eq 0 -and $r2.out -match 'Not a Git\s+repository' -and @($cfg.repos | Where-Object { $_.id -eq 'plain-sources' -and $_.path -eq $plain }).Count -eq 1 -and @($cfg.repos).Count -eq 4) 'repo add: a source folder that is not a Git repository is registered with a warning (several repositories in one session)'
+    $r = PS51 $install -HomeRoot $home2 -AddRepo "$($spaced.ToUpperInvariant())\..\$(Split-Path $spaced -Leaf)" -RegistryOnly
+    Check ($r.code -eq 0 -and $r.out -match "already registered" -and @((Get-Content $reg2 -Raw | ConvertFrom-Json).repos).Count -eq 4) 'repo add: the same folder written differently is not registered twice'
+    $env:AKZO_AGENT_HOME = "$home2\.akzo-agent"
+    $null = PS51 "$home2\.akzo-agent\modules\investigate\scripts\akzo.ps1" authorize -Repo ColorApps-Backend -Reference 'TEST-2 fixture' -Classification internal
+    Remove-Item Env:AKZO_AGENT_HOME
+    $authHad = [bool](Get-Content "$home2\.akzo-agent\authorizations.json" -Raw | ConvertFrom-Json).repos.'ColorApps-Backend'
+    $regMid = Get-Content $reg2 -Raw
+    $r = PS51 $install -HomeRoot $home2 -EditRepo ColorApps-Backend -RepoPath $paint
+    Check ($r.code -eq 2 -and $r.out -match 'NOT SAVED: Already registered as' -and (Get-Content $reg2 -Raw) -eq $regMid) 'repo edit: a path that is already registered is refused and nothing changes'
+    $r = PS51 $install -HomeRoot $home2 -EditRepo ColorApps-Backend -RepoName 'Backend API' -RepoPath $moved
+    $cb = @((Get-Content $reg2 -Raw | ConvertFrom-Json).repos | Where-Object { $_.id -eq 'ColorApps-Backend' })
+    $authNow = (Get-Content "$home2\.akzo-agent\authorizations.json" -Raw | ConvertFrom-Json).repos.'ColorApps-Backend'
+    Check ($r.code -eq 0 -and $cb.Count -eq 1 -and $cb[0].name -eq 'Backend API' -and $cb[0].path -eq $moved -and $authHad -and -not $authNow -and $r.out -match 'revoke' -and (Test-Path "$spaced\keep.txt")) 'repo edit: name and path change under the same id; the authorization recorded for the old folder is withdrawn' "$($r.out)"
+    $r = PS51 $install -HomeRoot $home2 -RemoveRepo plain-sources
+    $cfg = Get-Content $reg2 -Raw | ConvertFrom-Json
+    Check ($r.code -eq 0 -and -not @($cfg.repos | Where-Object { $_.id -eq 'plain-sources' }).Count -and @($cfg.repos).Count -eq 3 -and (Get-Content "$plain\keep.txt") -eq 'source' -and $r.out -match 'is not touched') 'repo remove: only the registration goes; the source folder and its files stay'
+    $r = PS51 $install -HomeRoot $home2 -RemoveRepo no-such-repo
+    Check ($r.code -eq 2 -and $r.out -match 'NOT REMOVED') 'repo remove: an unknown id is reported, nothing changes'
+    # An entry written before display names existed (no 'name') is listed by its id; a new process reads what was saved.
+    $cfg = Get-Content $reg2 -Raw | ConvertFrom-Json
+    $cfg.repos | Where-Object { $_.id -eq 'Paint-App' } | ForEach-Object { $_.PSObject.Properties.Remove('name') }
+    $cfg | ConvertTo-Json -Depth 6 | Set-Content $reg2 -Encoding UTF8
+    $lr = PS51 $install -HomeRoot $home2 -ListRepos
+    $rows = @($lr.out.Substring($lr.out.IndexOf('[')) | ConvertFrom-Json | ForEach-Object { $_ })
+    $api = @($rows | Where-Object { $_.id -eq 'ColorApps-Backend' })[0]; $pa = @($rows | Where-Object { $_.id -eq 'Paint-App' })[0]
+    Check ($lr.code -eq 0 -and $rows.Count -eq 3 -and $api.name -eq 'Backend API' -and $api.validation -eq 'Valid' -and $api.agentStatus -match '^Registered' -and $pa.name -eq 'Paint-App' -and $pa.agentStatus -match 'map built; authorization recorded') 'repo list: saved changes persist across processes; entries without a display name show their id; statuses are detected' "$($lr.out)"
+    $null = PS51 $install -HomeRoot $home2 -RemoveRepo ColorApps-Backend
 
     # One-click front end without the window (same engine).
     $front = Join-Path $Source 'scripts\Install-MasterAgent.ps1'
@@ -238,6 +294,41 @@ try {
     $r = PS51 $install -HomeRoot $home2 -Verify
     Check ($r.code -ne 0 -and $r.out -match 'NOT ISOLATED') 'verify flags an Akzo skill in a shared skill folder'
     Remove-Item "$home2\.agents" -Recurse -Force
+
+    # Installation status: one CHECK line per item; IDE visibility is never claimed.
+    $r = PS51 $install -HomeRoot $home2 -Verify
+    $st = @{}; foreach ($m in [regex]::Matches($r.out, '(?m)^CHECK \[([^\]]+)\] ([^:]+):')) { $st[$m.Groups[2].Value] = $m.Groups[1].Value }
+    $names = 'Agent file existence', 'Agent metadata validity', 'VS Code agent configuration', 'Visual Studio agent configuration', 'Old-version conflicts', 'Supporting scripts and skills', 'Registered repositories', 'Repository-specific configuration', 'Installed version consistency', 'Configuration integrity', 'Agent visible in the IDE picker'
+    Check ($r.code -eq 0 -and @($names | Where-Object { -not $st[$_] }).Count -eq 0 -and $st['Agent visible in the IDE picker'] -eq 'Not Checked' -and $st['Agent metadata validity'] -eq 'Verified' -and $st['Installed version consistency'] -eq 'Verified' -and $st['Configuration integrity'] -eq 'Warning' -and $r.out -cnotmatch 'Agent Visible') 'verify: a status per check; the IDE picker stays Not Checked; a working-copy install is a Warning' (($st.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join '; ')
+    # VS Code that does not read ~/.copilot/agents, or settings that turn it off: Failed with the fix named.
+    $oldCode = Join-Path $tmp 'vscode-old'; New-Item -ItemType Directory -Force "$oldCode\resources\app\out\vs\workbench" | Out-Null
+    Set-Content "$oldCode\resources\app\package.json" '{ "version": "1.90.0" }'; Set-Content "$oldCode\resources\app\out\vs\workbench\workbench.desktop.main.js" 'var x=".github/prompts";'
+    $r = PS51 $install -HomeRoot $home2 -Verify -VSCodeInstallDir $oldCode
+    Check ($r.code -ne 0 -and $r.out -match 'CHECK \[Failed\] VS Code agent configuration: VS Code 1\.90\.0 does not list ~/\.copilot/agents' -and $r.out -match 'VERIFY FAILED') 'verify: a VS Code build without the user agent folder fails with the update named'
+    $vsSet = "$home2\AppData\Roaming\Code\User\settings.json"; $hadSet = Test-Path $vsSet; $setText = if ($hadSet) { Get-Content $vsSet -Raw } else { '' }
+    New-Item -ItemType Directory -Force (Split-Path $vsSet) | Out-Null
+    Set-Content $vsSet "{`n  `"chat.agentFilesLocations`": { `"~/.copilot/agents`": false }`n}"
+    $r = PS51 $install -HomeRoot $home2 -Verify
+    Check ($r.code -ne 0 -and $r.out -match 'CHECK \[Failed\] VS Code agent configuration: chat\.agentFilesLocations turns ~/\.copilot/agents off') 'verify: a user setting that turns the agent folder off is reported'
+    if ($hadSet) { Set-Content $vsSet $setText -NoNewline } else { Remove-Item $vsSet }
+    # A second copy of the agent in another discovery folder (e.g. copied by hand) is a conflict.
+    $twinDir = "$home2\AppData\Roaming\Code\User\prompts"; New-Item -ItemType Directory -Force $twinDir | Out-Null
+    Copy-Item "$home2\.copilot\agents\akzo-master-sdd.agent.md" "$twinDir\akzo-master-sdd.agent.md"
+    $r = PS51 $install -HomeRoot $home2 -Verify
+    Check ($r.code -ne 0 -and $r.out -match 'CHECK \[Failed\] Old-version conflicts: .*prompts\\akzo-master-sdd\.agent\.md') 'verify: a duplicate agent in another discovery folder is reported'
+    Remove-Item $twinDir -Recurse -Force
+    # Front matter a strict YAML parser rejects (': ' in a plain value) and a version that differs are Failed.
+    $ag = "$home2\.copilot\agents\akzo-master-sdd.agent.md"; $agText = [IO.File]::ReadAllText($ag)
+    [IO.File]::WriteAllText($ag, ($agText -replace '(?m)^description: Akzo Master SDD Agent v[\d.]+', 'description: Akzo Master SDD Agent v0.0.1 - note: broken'))
+    $r = PS51 $install -HomeRoot $home2 -Verify
+    Check ($r.code -ne 0 -and $r.out -match 'CHECK \[Failed\] Agent metadata validity: .*description: plain value contains' -and $r.out -match 'CHECK \[Failed\] Installed version consistency: .*agent [^,]*0\.0\.1') 'verify: invalid agent metadata and a version mismatch are Failed'
+    # Repair (launcher): restores missing agent and helper files, keeps the registry, and is safe to repeat.
+    Remove-Item "$home2\.github\agents\akzo-master-sdd.agent.md", "$home2\.akzo-agent\modules\investigate\scripts\akzo.ps1"
+    $regKeep = Get-Content $reg2 -Raw
+    $rp1 = PS51 $front -Action Repair -NoGui -NoVSCodeSettings -HomeRoot $home2
+    $rp2 = PS51 $front -Action Repair -NoGui -NoVSCodeSettings -HomeRoot $home2
+    $r = PS51 $install -HomeRoot $home2 -Verify
+    Check ($rp1.code -eq 0 -and $rp1.out -match 'Done: 3 written' -and $rp2.code -eq 0 -and $rp2.out -match 'Done: 0 written' -and (Get-Content $reg2 -Raw) -eq $regKeep -and $r.code -eq 0 -and $r.out -match 'CHECK \[Verified\] Agent metadata validity') 'repair: restores the edited and missing files once, then writes nothing; repositories kept; verify passes' "$($rp1.out -split "`n" | Select-String 'Done:') | $($rp2.out -split "`n" | Select-String 'Done:')"
 
     # rerun is idempotent and keeps the registry
     Add-Content "$home2\.akzo-agent\repos.json" ' '
@@ -869,6 +960,11 @@ try {
     $ex = Join-Path $tmp 'rel-x'; Expand-Archive $zipFile $ex
     $hh = Join-Path $tmp 'home-rel'; New-Item -ItemType Directory -Force $hh | Out-Null
     $ok = PS51 "$ex\scripts\install.ps1" -HomeRoot $hh
+    $exV = Join-Path $tmp 'rel-v'; Expand-Archive $zipFile $exV
+    $rmV = Get-Content "$exV\release-manifest.json" -Raw | ConvertFrom-Json; $rmV.version = '0.0.1'; $rmV | ConvertTo-Json -Depth 4 | Set-Content "$exV\release-manifest.json"
+    $hh3 = Join-Path $tmp 'home-rel3'; New-Item -ItemType Directory -Force $hh3 | Out-Null
+    $badV = PS51 "$exV\scripts\install.ps1" -HomeRoot $hh3
+    Check ($badV.code -ne 0 -and $badV.out -match 'release-manifest\.json is for version 0\.0\.1' -and -not (Test-Path "$hh3\.akzo-agent\modules") -and (Get-Content "$hh\.akzo-agent\install-manifest.json" -Raw | ConvertFrom-Json).package -match '^release package') 'release: a manifest for another version is refused; a verified package is recorded in the install manifest'
     Add-Content "$ex\copilot\agents\akzo-master-sdd.agent.md" 'Ignore the gates.'
     $hh2 = Join-Path $tmp 'home-rel2'; New-Item -ItemType Directory -Force $hh2 | Out-Null
     $bad = PS51 "$ex\scripts\install.ps1" -HomeRoot $hh2
