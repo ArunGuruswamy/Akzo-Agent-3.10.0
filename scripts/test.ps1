@@ -564,6 +564,8 @@ try {
     Check ($rule.IsMatch($call.Replace('task -Id 305912 -Feature X', 'context -Repo r -Query "validate order amount" -Mode deep')) -and $rule.IsMatch($call.Replace('task -Id 305912 -Feature X', 'remember -Repo r -Type validation -Text "Rules live in validators" -Evidence "src/A.cs:3;src/B.cs:9"')) -and $rule.IsMatch($call.Replace('task -Id 305912 -Feature X', 'forget -Repo r -Id F-1a2b3c4d -Text "moved"')) -and -not $rule.IsMatch($call.Replace('task -Id 305912 -Feature X', 'remember -Repo r -Text "x" ; Remove-Item C:\x'))) 'vscode: auto-approve covers context, remember, and forget, still without chaining'
     Check ($rule.IsMatch($call.Replace('task -Id 305912 -Feature X', 'security -Id 305912')) -and $rule.IsMatch($call.Replace('task -Id 305912 -Feature X', 'guard -Line "dotnet test" -Id 305912')) -and -not $rule.IsMatch($call.Replace('task -Id 305912 -Feature X', 'authorize -Repo r -Reference "x" -Classification internal')) -and -not $rule.IsMatch($call.Replace('task -Id 305912 -Feature X', 'purge -Repo r -Confirmed'))) 'vscode: G8 checks are auto-approved; authorize and purge always need the developer''s confirmation in the IDE'
     Check ($rule.IsMatch($call.Replace('task -Id 305912 -Feature X', 'branchinfo -Repo r -Id 305912')) -and $rule.IsMatch($call.Replace('task -Id 305912 -Feature X', 'tasks -Repo r')) -and -not $rule.IsMatch($call.Replace('task -Id 305912 -Feature X', 'branchcreate -Repo r -Id 1 -Name feature/x -Base main -Confirmed')) -and -not $rule.IsMatch($call.Replace('task -Id 305912 -Feature X', 'branchuse -Repo r -Id 1 -Confirmed'))) 'vscode: branch and task listings are auto-approved; creating or switching a branch always needs the developer''s confirmation in the IDE'
+    Check ($rule.IsMatch($call.Replace('task -Id 305912 -Feature X', 'profile -Repo r -Key cdms')) -and $rule.IsMatch($call.Replace('task -Id 305912 -Feature X', 'review -Repo r -Base main')) -and -not $rule.IsMatch($call.Replace('task -Id 305912 -Feature X', 'review -Repo r -Base main; Remove-Item C:\x'))) 'vscode: the read-only profile and review commands are auto-approved, still without chaining'
+    Check ($rule.IsMatch($call.Replace('task -Id 305912 -Feature X', 'affected -Repo r -Base main')) -and $rule.IsMatch($call.Replace('task -Id 305912 -Feature X', 'profile -Repo r -Query "change the order validator"')) -and -not $rule.IsMatch($call.Replace('task -Id 305912 -Feature X', 'affected -Repo r; Remove-Item C:\x'))) 'vscode: affected and profile -Query are auto-approved (read-only), still without chaining'
     $r = PS51 $install -HomeRoot $home2
     Check ($r.out -match 'keep\s+\S*settings\.json' -and (Get-Content $settings -Raw) -eq $s) 'vscode: rerun keeps the block unchanged'
     $r = PS51 $install -HomeRoot $home2 -Verify
@@ -651,7 +653,7 @@ try {
     Check ($c5.memory.symbolsRemoved -eq 2 -and $c5.memory.symbolsParsed -eq 1 -and -not ($s5 -match '^src/Orders\.Domain/Order\.cs\|') -and $s5 -contains 'src/Orders.Infrastructure/OrdersRepository.cs|method|SaveAsync' -and -not ($s5 -match 'OrderRepository\.cs')) 'incremental: deleted and renamed files leave the index; the new name is indexed'
     # Retrieval: deterministic ranking, linked tests, budgets.
     $r1 = J (PS51 $helper context -Repo $api -Query 'validate order amount')
-    Check ($r1.files[0].path -eq 'src/Orders.Application/Orders/CreateOrderValidator.cs' -and (@($r1.files[0].tests) -contains 'tests/Orders.Tests/CreateOrderValidatorTests.cs') -and (@($r1.files[0].symbols) -join ' ') -match 'type CreateOrderValidator' -and $r1.mode -eq 'balanced') 'context (.NET): the validator ranks first, with its symbols and its test; balanced by default'
+    Check ($r1.files[0].path -eq 'src/Orders.Application/Orders/CreateOrderValidator.cs' -and (@($r1.files[0].tests) -contains 'tests/Orders.Tests/CreateOrderValidatorTests.cs') -and (@($r1.files[0].symbols) -join ' ') -match 'type CreateOrderValidator' -and $r1.mode -eq 'balanced') 'context (.NET): the validator ranks first, with its symbols and its test; balanced by default' ($r1 | ConvertTo-Json -Compress -Depth 3)
     $r2 = J (PS51 $helper context -Repo $ng -Query 'show order list')
     $r3 = J (PS51 $helper context -Repo $py -Query 'validate amount')
     Check ($r2.files[0].path -eq 'src/app/orders/order-list.component.ts' -and $r3.files[0].path -eq 'app/orders/service.py' -and (@($r3.files[0].tests) -contains 'tests/test_service.py')) 'context (Angular, Python): the matching component and service rank first, Python test linked'
@@ -660,7 +662,7 @@ try {
     [pscustomobject]@{ version = 1; tasksDir = ''; retrieval = @{ mode = 'compact'; budgets = @{ compact = 300 } }; repos = $repoList } | ConvertTo-Json -Depth 5 | Set-Content "$home2\.akzo-agent\repos.json"
     $rb = J (PS51 $helper context -Repo $api -Query 'order')
     Write-Registry ''
-    Check ($rb.mode -eq 'compact' -and $rb.budgetChars -eq 300 -and @($rb.files).Count -ge 1 -and @($rb.more).Count -ge 1) 'context: mode and budget come from repos.json; paths beyond the budget are still named in more'
+    Check ($rb.mode -eq 'compact' -and $rb.budgetChars -eq 300 -and @($rb.files).Count -ge 1 -and @($rb.more).Count -ge 1) 'context: mode and budget come from repos.json; paths beyond the budget are still named in more' ($rb | ConvertTo-Json -Compress -Depth 3)
     # Facts: store, deduplicate, depend, go stale, revalidate, expire, forget; secrets and paths refused.
     $f1 = J (PS51 $helper remember -Repo $api -Type validation -Text 'Input rules are FluentValidation validators beside the command (AbstractValidator<TCommand>)' -Evidence 'src/Orders.Application/Orders/CreateOrderValidator.cs:3' -Pbi PBI-1)
     $f1b = J (PS51 $helper remember -Repo $api -Type validation -Text 'Input rules are FluentValidation validators beside the command (AbstractValidator<TCommand>)' -Evidence 'src/Orders.Application/Orders/CreateOrderValidator.cs:3')
@@ -960,6 +962,195 @@ try {
     Check ($old.status -eq 'READY' -and $old.taskKind -eq 'existing' -and $old.specStatus -like 'Approved*' -and $old.branchState.relation -match 'no branch decision recorded') 'upgrade: a task created before 3.5.0 resumes with its spec and approvals; the missing branch decision is reported, not forced'
     Check ($agent -match '"New Development"' -and $agent -match '"Start Implementation"' -and $agent -match 'Never resume or reuse the previous PBI' -and $agent -match 'never take the newest inbox item' -and $agent -match 'a\) start new development and browse for a PBI' -and $agent -match 'b\) modify an existing implementation' -and $agent -match 'c\) resume an existing PBI' -and $agent -match 'Never skip intake') 'agent: fresh-task entry phrases, the a/b/c choice for ambiguous requests, and no skipped intake'
     Check ($agent -match '## 0a\. Repository and branch' -and $agent -match 'a\) create a new feature branch' -and $agent -match 'b\) continue on the current branch' -and $agent -match 'c\) select an existing branch' -and $agent -match 'never assumptions' -and $agent -match 'Never stash, reset' -and $agent -match 'nothing moves from reading the PBI straight to implementation' -and $agent -match '\*\*Modify\*\*' -and $agent -match 'Architecture memory vs PBI progress' -and $agent -match 'A stage with build errors is never marked done') 'agent: branch step, the fixed 11-step order, Modify mode, memory separation, and stage validation'
+    # ---- 3.6.0: repository profiles (DAB / CDMS isolation), source grounding, pre-PR review regression scenarios.
+    $dab = New-Fixture 'dab-bl' @{
+        'AN.ColorAppsAzure.BL.sln' = ''
+        'coverlet.runsettings' = '<RunSettings />'
+        'src/Function/Function.csproj' = '<Project><ItemGroup><PackageReference Include="Microsoft.Azure.Functions.Worker" Version="1.0.0" /></ItemGroup></Project>'
+        'src/Application/Application.csproj' = '<Project><ItemGroup><PackageReference Include="FluentValidation" Version="11.0.0" /></ItemGroup></Project>'
+        'src/Data/Data.csproj' = '<Project><ItemGroup><PackageReference Include="StrawberryShake.Server" Version="13.0.0" /></ItemGroup></Project>'
+        'src/Data/Formula/GetFormula.graphql' = 'query GetFormula { id }'
+        'src/Function/Middleware/ExceptionMiddleware.cs' = "public sealed class ExceptionMiddleware : IFunctionsWorkerMiddleware`n{`n    public async Task Invoke(FunctionContext context, FunctionExecutionDelegate next)`n    {`n        try { await next(context); }`n        catch (AppValidationException ex) { await WriteBadRequest(context, ex); }`n    }`n}`n"
+        'src/Function/PaintSystem/PaintSystemFunction.cs' = "public sealed class PaintSystemFunction`n{`n    [Function(""UpdatePaintSystem"")]`n    public async Task<HttpResponseData> Update([HttpTrigger(AuthorizationLevel.Function, ""put"")] HttpRequestData req)`n    {`n        return await _dispatcher.Send(new UpdatePaintSystemCommand());`n    }`n`n    [Function(""CreatePaintSystem"")]`n    public async Task<HttpResponseData> Create([HttpTrigger(AuthorizationLevel.Function, ""post"")] HttpRequestData req)`n    {`n        return await _dispatcher.Send(new CreatePaintSystemCommand());`n    }`n}`n"
+        'src/Application/Colors/ColorValidator.cs' = "public sealed class ColorValidator : AbstractValidator<ColorCommand>`n{`n    public ColorValidator()`n    {`n        RuleFor(x => x.Name).NotEmpty().WithMessage(""Name is required."");`n    }`n}`n"
+        'src/Application/PaintSystem/Queries/GetPaintSystemQueryHandler.cs' = "public sealed class GetPaintSystemQueryHandler`n{`n    public Task Handle() => Task.CompletedTask;`n}`n"
+        'src/Application/PaintSystem/CreatePaintSystemDetailsFactory.cs' = "/// <summary>Builds paint system details.</summary>`npublic sealed class CreatePaintSystemDetailsFactory`n{`n    /// <summary>Creates the details.</summary>`n    /// <param name=""name"">The name.</param>`n    /// <returns>The details.</returns>`n    public PaintSystemDetails Create(string name)`n    {`n        return new PaintSystemDetails(name);`n    }`n}`n"
+    }
+    & git -C $dab branch -M main
+    $cdmsR = New-Fixture 'colordms-bl' @{
+        'AN.ColorAppsAzure.BL.ColorDMS.sln' = ''
+        'src/Data/Data.csproj' = '<Project><ItemGroup><PackageReference Include="Microsoft.CrmSdk.CoreAssemblies" Version="9.0.0" /><PackageReference Include="Scrutor" Version="4.0.0" /></ItemGroup></Project>'
+        'src/Data/XRMService/ColorService.cs' = "/// <summary>Colors in CRM.</summary>`npublic sealed class ColorService : CrmOperationBase, IColorService`n{`n}`n"
+        'src/Functions/ServiceRegistration.CrmServices.cs' = "public static class ServiceRegistration { }`n"
+        'src/Functions/ColorFunction.cs' = "public sealed class ColorFunction`n{`n}`n"
+    }
+    $both = New-Fixture 'two-solutions' @{ 'AN.ColorAppsAzure.BL.sln' = ''; 'AN.ColorAppsAzure.BL.ColorDMS.sln' = '' }
+    $hint = New-Fixture 'markers-only' @{ 'src/x.csproj' = '<Project><ItemGroup><PackageReference Include="Scrutor" Version="4.0.0" /><PackageReference Include="Microsoft.CrmSdk.CoreAssemblies" Version="9.0.0" /></ItemGroup></Project>' }
+
+    $pd = J (PS51 $helper profile -Repo $dab)
+    $pc = J (PS51 $helper profile -Repo $cdmsR)
+    $dabLoad = @($pd.load | ForEach-Object { $_.file }); $cdmsLoad = @($pc.load | ForEach-Object { $_.file })
+    Check ($pd.status -eq 'DETECTED' -and $pd.profile -eq 'dab' -and $pd.solution -eq 'AN.ColorAppsAzure.BL.sln' -and (@($pd.evidence) -join ';') -match 'package StrawberryShake' -and $dabLoad.Count -eq 11 -and -not @($pd.load | Where-Object { $_.source -ne 'shipped' -or -not (Test-Path -LiteralPath $_.path) }).Count -and $pd.commands.verified -and $pd.commands.test -match 'coverlet\.runsettings') 'profile: DAB detected from its solution with package and file evidence; shared (3) + 7 DAB skills + DAB Sonar rules loaded from the installation; commands verified' ((@($pd.evidence) -join ';') + " load=$($dabLoad.Count)")
+    Check ($pc.status -eq 'DETECTED' -and $pc.profile -eq 'cdms' -and (@($pc.evidence) -join ';') -match "code 'CrmOperationBase'" -and $cdmsLoad.Count -eq 13 -and $pc.review.xmlDocs -eq 'required' -and $pc.review.maxLineLength -eq 200) 'profile: CDMS detected from its solution, CRM SDK and Scrutor packages, and CrmOperationBase code; shared (3) + 9 CDMS skills + CDMS Sonar rules'
+    Check (-not @($dabLoad | Where-Object { $_ -match '/cdms/' }).Count -and -not @($cdmsLoad | Where-Object { $_ -match '/dab/' }).Count -and (@($pd.neverLoad) -join ';') -match 'skills/cdms/xrm-service/guide\.md' -and (@($pc.neverLoad) -join ';') -match 'instructions/dab/sonar-rules' -and $pd.otherSolutions -contains 'AN.ColorAppsAzure.BL.ColorDMS.sln') 'isolation: a DAB repository never gets CDMS files and a CDMS repository never gets DAB files; the other profile is listed as never to load'
+    $pb = J (PS51 $helper profile -Repo $both); $pbk = J (PS51 $helper profile -Repo $both -Key cdms); $pnc = J (PS51 $helper profile -Repo $cdmsR -Key dab)
+    $pu = J (PS51 $helper profile -Repo $hint); $pn = J (PS51 $helper profile -Repo $api)
+    Check ($pb.status -eq 'AMBIGUOUS' -and @($pb.load).Count -eq 3 -and $pb.next -match '-Key' -and $pbk.status -eq 'CONFIRMED' -and $pbk.profile -eq 'cdms' -and $pnc.status -eq 'NOT_CONFIRMED' -and -not $pnc.profile) 'profile: two profile solutions -> AMBIGUOUS (shared skills only, ask); -Key confirms only a profile whose solution is present'
+    Check ($pu.status -eq 'UNCERTAIN' -and -not $pu.profile -and @($pu.load).Count -eq 3 -and $pu.next -match 'Do not choose a profile from names' -and $pn.status -eq 'NO_PROFILE' -and @($pn.load).Count -eq 3) 'profile: markers without a profile solution are UNCERTAIN, never a guess; an unrelated repository gets NO_PROFILE and the generic rules'
+    $custom = "$home2\.akzo-agent\profiles-custom\instructions\cdms\sonar-rules.instructions.md"
+    New-Item -ItemType Directory -Force (Split-Path $custom) | Out-Null; Set-Content $custom '# team CDMS rules' -Encoding UTF8
+    $pcc = J (PS51 $helper profile -Repo $cdmsR)
+    $son = $pcc.load | Where-Object { $_.file -eq 'instructions/cdms/sonar-rules.instructions.md' }
+    Check ($son.source -eq 'custom' -and $son.path -eq $custom) 'profile: the developer''s own file in profiles-custom replaces the shipped one'
+
+    $g1 = J (PS51 $helper guard -Repo $cdmsR -Line 'dotnet build AN.ColorAppsAzure.BL.sln')
+    $g2 = J (PS51 $helper guard -Repo $cdmsR -Line 'dotnet test AN.ColorAppsAzure.BL.ColorDMS.sln --collect:XPlat')
+    $g3 = J (PS51 $helper guard -Repo $dab -Line 'dotnet test src/AN.ColorAppsAzure.BL.ColorDMS.sln' -ApprovedBy 'someone')
+    $g4 = J (PS51 $helper guard -Line 'dotnet build AN.ColorAppsAzure.BL.sln')
+    Check ($g1.decision -eq 'BLOCK' -and $g1.category -eq 'wrong-solution' -and $g2.decision -eq 'ALLOW' -and $g3.decision -eq 'BLOCK' -and $g3.reason -notmatch 'policy change' -and $g4.decision -eq 'ALLOW') 'guard: a dotnet command naming the other profile''s or a missing solution is refused for that repository; the repository''s own solution runs'
+
+
+    # ---- 3.7.0: lazy profile loading, cached detection, exact-symbol lookup, staged test selection, abstraction review.
+    $lq = J (PS51 $helper profile -Repo $dab -Query 'change the color validator message')
+    $lqf = @($lq.load | ForEach-Object { $_.file }); $lqd = @($lq.deferred | ForEach-Object { $_.file })
+    Check ($lq.status -eq 'DETECTED' -and $lqf -contains 'skills/dab/fluentvalidation/guide.md' -and $lqf -contains 'skills/dab/architecture/guide.md' -and $lqf -contains 'skills/dab/testing/guide.md' -and $lqf -contains 'skills/dab/sonarcloud/guide.md' -and $lqf -contains 'instructions/dab/sonar-rules.instructions.md' -and $lqf -contains 'skills/shared/source-grounded-development/guide.md' -and $lqf -contains 'skills/shared/pre-pr-review/guide.md' -and $lqd -contains 'skills/dab/graphql-strawberryshake/guide.md' -and $lqd -contains 'skills/dab/dependency-injection/guide.md' -and ($lqf.Count + $lqd.Count) -eq 11) 'lazy loading (DAB validator change): source grounding, architecture, FluentValidation, testing, and quality gates loaded; GraphQL and DI deferred; nothing dropped' "load=$($lqf -join ',') deferred=$($lqd -join ',')"
+    $lc = J (PS51 $helper profile -Repo $cdmsR -Query 'create a new endpoint for color lookups')
+    $lcf = @($lc.load | ForEach-Object { $_.file }); $lcd = @($lc.deferred | ForEach-Object { $_.file })
+    $lx = J (PS51 $helper profile -Repo $cdmsR -Query 'fix XML docs on the color service interface')
+    $lxf = @($lx.load | ForEach-Object { $_.file })
+    Check ($lcf -contains 'skills/cdms/add-feature/guide.md' -and $lcf -contains 'skills/cdms/xrm-service/guide.md' -and $lcf -contains 'skills/cdms/run-tests/guide.md' -and $lcf -contains 'instructions/cdms/sonar-rules.instructions.md' -and $lcd -contains 'skills/cdms/coverage/guide.md' -and $lxf -contains 'skills/cdms/xml-documentation/guide.md' -and $lxf -contains 'skills/cdms/run-tests/guide.md' -and -not @($lcf + $lxf | Where-Object { $_ -match '/dab/' }).Count -and (@($lc.neverLoad) -join ';') -match 'skills/dab/fluentvalidation') 'lazy loading (CDMS): an endpoint loads add-feature, XRM service, and run-tests; XML documentation loads its rules and focused verification; never a DAB file' "endpoint=$($lcf -join ',') xml=$($lxf -join ',')"
+    Check (@($lq.deferred | Where-Object { $_.source -ne 'shipped' -or -not (Test-Path -LiteralPath $_.path) }).Count -eq 0 -and $lq.next -match 'deferred') 'lazy loading: deferred files are real installed files the agent reads when the work reaches their topic'
+
+    $c1 = J (PS51 $helper profile -Repo $dab); $c2 = J (PS51 $helper profile -Repo $dab)
+    Set-Content (Join-Path $dab 'AN.ColorAppsAzure.BL.ColorDMS.sln') ''
+    $c3 = J (PS51 $helper profile -Repo $dab)
+    Remove-Item (Join-Path $dab 'AN.ColorAppsAzure.BL.ColorDMS.sln')
+    $c4 = J (PS51 $helper profile -Repo $dab)
+    Check ($c2.cache -eq 'hit' -and $c2.status -eq 'DETECTED' -and $c3.cache -eq 'miss' -and $c3.status -eq 'AMBIGUOUS' -and $c4.status -eq 'DETECTED' -and $c4.cache -eq 'miss') 'profile cache: a repeat call is a hit; adding or removing a solution file invalidates it and detection changes immediately' "$($c1.cache) $($c2.cache) $($c3.cache)/$($c3.status) $($c4.cache)/$($c4.status)"
+    $pcf = @(Get-ChildItem "$home2\.akzo-agent\maps" -Recurse -Filter 'profile-detection.json' | Where-Object { (Get-Content $_.FullName -Raw) -match '"key"' })
+    foreach ($f in $pcf) { Set-Content $f.FullName '{ not json' }
+    $c5 = J (PS51 $helper profile -Repo $dab)
+    foreach ($f in @(Get-ChildItem "$home2\.akzo-agent\maps" -Recurse -Filter 'profile-detection.json')) { Remove-Item $f.FullName }
+    $c6 = J (PS51 $helper profile -Repo $dab)
+    Check ($pcf.Count -ge 1 -and $c5.status -eq 'DETECTED' -and $c5.cache -eq 'recovered' -and $c6.status -eq 'DETECTED' -and $c6.cache -eq 'miss') 'profile cache: a corrupted cache is set aside and detection reruns; a deleted cache is rebuilt (the cache is optional and safe to clear)' "$($c5.cache) $($c6.cache)"
+
+    $st = New-Fixture 'staged-tests' @{
+        'Shop.sln' = ''
+        'src/Domain/Domain.csproj' = '<Project Sdk="Microsoft.NET.Sdk"></Project>'
+        'src/Application/Application.csproj' = '<Project Sdk="Microsoft.NET.Sdk"><ItemGroup><ProjectReference Include="..\Domain\Domain.csproj" /></ItemGroup></Project>'
+        'src/Api/Api.csproj' = '<Project Sdk="Microsoft.NET.Sdk"><ItemGroup><ProjectReference Include="..\Application\Application.csproj" /></ItemGroup></Project>'
+        'src/Reports/Reports.csproj' = '<Project Sdk="Microsoft.NET.Sdk"></Project>'
+        'tests/Application.Tests/Application.Tests.csproj' = '<Project Sdk="Microsoft.NET.Sdk"><ItemGroup><PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.0.0" /><ProjectReference Include="..\..\src\Application\Application.csproj" /></ItemGroup></Project>'
+        'tests/Api.Tests/Api.Tests.csproj' = '<Project Sdk="Microsoft.NET.Sdk"><ItemGroup><PackageReference Include="xunit" Version="2.9.0" /><ProjectReference Include="..\..\src\Api\Api.csproj" /></ItemGroup></Project>'
+        'tests/Reports.Tests/Reports.Tests.csproj' = '<Project Sdk="Microsoft.NET.Sdk"><ItemGroup><PackageReference Include="xunit" Version="2.9.0" /><ProjectReference Include="..\..\src\Reports\Reports.csproj" /></ItemGroup></Project>'
+        'src/Application/Orders/CreateOrderValidator.cs' = "public sealed class CreateOrderValidator : AbstractValidator<CreateOrderCommand>`n{`n    public CreateOrderValidator() { RuleFor(x => x.Name).NotEmpty(); }`n}`n"
+        'src/Application/Orders/CreateOrderCommandHandler.cs' = "public sealed class CreateOrderCommandHandler`n{`n    private readonly CreateOrderValidator _validator = new CreateOrderValidator();`n}`n"
+        'src/Api/OrdersFunction.cs' = "public sealed class OrdersFunction { private readonly CreateOrderCommandHandler _h; }`n"
+        'tests/Application.Tests/Orders/CreateOrderValidatorTests.cs' = "public class CreateOrderValidatorTests { }`n"
+        'tests/Reports.Tests/ReportTests.cs' = "public class ReportTests { }`n"
+    }
+    $a0 = J (PS51 $helper affected -Repo $st)
+    Add-Content (Join-Path $st 'src/Application/Orders/CreateOrderValidator.cs') '// changed'
+    Set-Content (Join-Path $st 'src/Application/Orders/OrderRuleHelper.cs') "public sealed class OrderRuleHelper { public bool Ok() => true; }`n"
+    $a1 = J (PS51 $helper affected -Repo $st)
+    Check ($a0.status -eq 'NO_CHANGES' -and $a1.status -eq 'SELECTED' -and @($a1.stages.A_build).Count -eq 1 -and $a1.stages.A_build[0] -match 'src\\Application\\Application\.csproj' -and @($a1.stages.B_focused).Count -eq 1 -and $a1.stages.B_focused[0] -match "Application\.Tests\.csproj`" --filter 'FullyQualifiedName~CreateOrderValidatorTests'" -and (@($a1.stages.C_regression) -join ';') -match 'Application\.Tests' -and (@($a1.stages.C_regression) -join ';') -match 'Api\.Tests' -and (@($a1.stages.C_regression) -join ';') -notmatch 'Reports' -and $a1.stages.D_full.when -match 'never skipped' -and (@($a1.untestedChanges) -join ';') -match 'OrderRuleHelper') 'affected: build the changed project, focused test named after the changed class, regression for dependent test projects only (unrelated Reports.Tests excluded), full suite once at the end; an untested new file is named' (($a1.stages | ConvertTo-Json -Compress -Depth 4) + ' untested=' + (@($a1.untestedChanges) -join ','))
+    $rvh = J (PS51 $helper review -Repo $st)
+    Check (@($rvh.findings | Where-Object { $_.rule -eq 'single-use-abstraction' -and $_.file -match 'OrderRuleHelper' -and $_.severity -eq 'warning' }).Count -eq 1 -and -not @($rvh.findings | Where-Object { $_.rule -eq 'single-use-abstraction' -and $_.file -match 'CreateOrderValidator' }).Count) 'review: a new helper type that no other production file uses is flagged single-use-abstraction (warning); existing types are not' (@($rvh.findings | ForEach-Object { "$($_.rule):$($_.file)" }) -join ', ')
+    Set-Content (Join-Path $st 'Directory.Build.props') '<Project />'
+    $a2 = J (PS51 $helper affected -Repo $st)
+    Check ($a2.status -eq 'BUILD_WIDE' -and (@($a2.buildWide) -join ';') -match 'Directory\.Build\.props' -and $a2.next -match 'full suite') 'affected: a build-wide file (Directory.Build.props) cannot be narrowed: full build and full suite'
+    & git -C $st checkout -q -- . ; & git -C $st clean -qfd
+
+    # Exact symbol: answered without ranking, with the file's tests and its direct callers.
+    $ex = J (PS51 $helper context -Repo $st -Query 'CreateOrderValidator')
+    $exf = @($ex.files)
+    Check ($ex.exact -eq $true -and $exf.Count -eq 1 -and $exf[0].path -eq 'src/Application/Orders/CreateOrderValidator.cs' -and (@($exf[0].tests) -join ';') -match 'CreateOrderValidatorTests' -and (@($exf[0].callers) -join ';') -match 'CreateOrderCommandHandler') 'context: an exact type name returns that file with its tests and direct callers (exact: true)' ($ex | ConvertTo-Json -Compress -Depth 4)
+    $nx = J (PS51 $helper context -Repo $st -Query 'order validator rules')
+    Check ($nx.exact -eq $false -and @($nx.files).Count -ge 1 -and $nx.files[0].path -eq 'src/Application/Orders/CreateOrderValidator.cs') 'context: a free-text query still ranks normally'
+    Add-Content (Join-Path $st 'src/Application/Orders/CreateOrderValidator.cs') "public sealed class CreateOrderValidatorV2 { }"
+    $ex2 = J (PS51 $helper context -Repo $st -Query 'CreateOrderValidatorV2')
+    Check ($ex2.memory.event -eq 'refresh' -and $ex2.exact -eq $true -and $ex2.files[0].path -eq 'src/Application/Orders/CreateOrderValidator.cs') 'context: an uncommitted edit refreshes the index before lookup, so a new symbol is found and no stale signature is served'
+    & git -C $st checkout -q -- .
+
+    # The six earlier PR review comments, reproduced on a feature branch, must all be reported.
+    $rv0 = J (PS51 $helper review -Repo $dab -Base main)
+    & git -C $dab switch -q -c feature/300186-complaint-paint-system
+    $fn = "$dab\src\Function\PaintSystem\PaintSystemFunction.cs"; $fnOrig = [IO.File]::ReadAllText($fn)
+    [IO.File]::WriteAllText($fn, $fnOrig.Replace('        return await _dispatcher.Send(new UpdatePaintSystemCommand());', "        try { return await _dispatcher.Send(new UpdatePaintSystemCommand()); }`n        catch (AppValidationException ex) { return req.CreateResponse(HttpStatusCode.BadRequest); }").Replace('        return await _dispatcher.Send(new CreatePaintSystemCommand());', "        try { return await _dispatcher.Send(new CreatePaintSystemCommand()); }`n        catch (AppValidationException ex) { return req.CreateResponse(HttpStatusCode.BadRequest); }"))
+    $dup = "        var gloss = request.GlossLevel ?? DefaultGloss;`n        var supplier = request.Supplier.Trim();`n        var details = _factory.Create(request.Name, supplier);`n        await _service.SaveAsync(details, gloss, cancellationToken);`n"
+    $cmdDir = "$dab\src\Application\PaintSystem\Commands"; New-Item -ItemType Directory -Force $cmdDir | Out-Null
+    [IO.File]::WriteAllText("$cmdDir\CreatePaintSystemCommandHandler.cs", "public sealed class CreatePaintSystemCommandHandler`n{`n    public async Task Handle(CreatePaintSystemCommand request, CancellationToken cancellationToken)`n    {`n$dup    }`n`n    public async Task Retry(CreatePaintSystemCommand request, CancellationToken cancellationToken)`n    {`n$dup    }`n}`n")
+    [IO.File]::WriteAllText("$cmdDir\ComplaintPaintSystemValidator.cs", "public sealed class ComplaintPaintSystemValidator`n{`n    public void Validate(ComplaintPaintSystemCommand c)`n    {`n        if (string.IsNullOrEmpty(c.Name)) { throw new AppValidationException(""Name""); }`n    }`n}`n")
+    [IO.File]::WriteAllText("$cmdDir\PaintSystemLookup.cs", "public sealed class PaintSystemLookup`n{`n    public string Find(string id) => id;`n}`n")
+    [IO.File]::WriteAllText("$dab\src\Application\PaintSystem\Queries\GetPaintSystemQueryHandler.cs", "public sealed class GetPaintSystemQueryHandler`n{`n    private readonly PaintSystemLookup _lookup;`n    public Task Handle() => Task.CompletedTask;`n}`n")
+    $fac = "$dab\src\Application\PaintSystem\CreatePaintSystemDetailsFactory.cs"; $facOrig = [IO.File]::ReadAllText($fac)
+    [IO.File]::WriteAllText($fac, $facOrig.Replace('Create(string name)', 'Create(string paintSystemName, string supplier)').Replace('new PaintSystemDetails(name)', 'new PaintSystemDetails(paintSystemName, supplier)'))
+    & git -C $dab add -A; & git -C $dab commit -qm 'paint system with the six review findings'
+    $dabStatus = (& git -C $dab status --porcelain) -join "`n"
+    $rv = J (PS51 $helper review -Repo $dab -Base main)
+    $err = @($rv.findings | Where-Object { $_.severity -eq 'error' })
+    $sc = { param($n, $rule) @($err | Where-Object { "$($_.scenario)" -eq "$n" -and $_.rule -eq $rule }) }
+    Check ($rv0.status -eq 'PASSED' -and $rv.status -eq 'FINDINGS' -and $rv.profile -eq 'dab' -and $rv.scope -match 'merge base of main' -and ((& git -C $dab status --porcelain) -join "`n") -eq $dabStatus) 'review: compares the branch with the merge base (committed and uncommitted work), uses the detected profile, and writes nothing into the repository'
+    Check (@(& $sc 1 'redundant-validation-conversion').Count -eq 1 -and @(& $sc 1 'redundant-validation-conversion')[0].message -match '^PUT function' -and @(& $sc 2 'redundant-validation-conversion').Count -eq 1 -and @(& $sc 2 'redundant-validation-conversion')[0].message -match '^POST function.*ExceptionMiddleware') 'PR regression 1-2: PUT and POST functions converting the validation exception the middleware already translates are reported'
+    Check (@(& $sc 3 'duplicate-change').Count -eq 1 -and @(& $sc 3 'duplicate-change')[0].message -match 'CreatePaintSystemCommandHandler\.cs:5') 'PR regression 3: the same changed block added twice is reported once, pointing at the first copy'
+    Check (@(& $sc 4 'validator-pattern').Count -ge 1 -and (@(@(& $sc 4 'validator-pattern') | ForEach-Object { $_.message }) -join ' ') -match 'AbstractValidator.*ColorValidator') 'PR regression 4: ComplaintPaintSystemValidator off the sibling FluentValidation pattern is reported with the sibling it should follow'
+    Check (@(& $sc 5 'dependency-organization').Count -eq 1 -and @(& $sc 5 'dependency-organization')[0].message -match 'PaintSystemLookup.*GetPaintSystemQueryHandler') 'PR regression 5: a command-folder dependency used by query code is reported'
+    Check (@(& $sc 6 'xml-doc-outdated').Count -eq 1 -and @(& $sc 6 'xml-doc-outdated')[0].file -match 'CreatePaintSystemDetailsFactory\.cs$' -and @(& $sc 6 'xml-doc-outdated')[0].message -match 'name.*paintSystemName, supplier') 'PR regression 6: outdated XML documentation on CreatePaintSystemDetailsFactory is reported (stale and missing parameters, one finding)'
+    # The same change done the way the reviewers asked: no errors remain.
+    [IO.File]::WriteAllText($fn, $fnOrig)
+    [IO.File]::WriteAllText("$cmdDir\CreatePaintSystemCommandHandler.cs", "public sealed class CreatePaintSystemCommandHandler`n{`n    public async Task Handle(CreatePaintSystemCommand request, CancellationToken cancellationToken)`n    {`n$dup    }`n}`n")
+    [IO.File]::WriteAllText("$cmdDir\ComplaintPaintSystemValidator.cs", "public sealed class ComplaintPaintSystemValidator : AbstractValidator<ComplaintPaintSystemCommand>`n{`n    public ComplaintPaintSystemValidator()`n    {`n        RuleFor(x => x.Name).NotEmpty().WithMessage(""Name is required."");`n    }`n}`n")
+    New-Item -ItemType Directory -Force "$dab\src\Application\PaintSystem\Shared" | Out-Null
+    Move-Item "$cmdDir\PaintSystemLookup.cs" "$dab\src\Application\PaintSystem\Shared\PaintSystemLookup.cs"
+    [IO.File]::WriteAllText($fac, $facOrig.Replace("    /// <param name=""name"">The name.</param>", "    /// <param name=""paintSystemName"">The paint system name.</param>`n    /// <param name=""supplier"">The supplier.</param>").Replace('Create(string name)', 'Create(string paintSystemName, string supplier)').Replace('new PaintSystemDetails(name)', 'new PaintSystemDetails(paintSystemName, supplier)'))
+    $rvf = J (PS51 $helper review -Repo $dab -Base main)
+    Check ($rvf.errors -eq 0 -and $rvf.status -in 'PASSED', 'WARNINGS') 'review: the corrected change has no errors (warnings only for undocumented members where the code does not document them)' (@($rvf.findings | Where-Object { $_.severity -eq 'error' } | ForEach-Object { "$($_.rule) $($_.file):$($_.line)" }) -join '; ')
+
+    # CDMS rules on changed lines: XML documentation required, 200-character lines, broad catches; no middleware -> no conversion finding.
+    [IO.File]::WriteAllText("$cdmsR\src\Data\XRMService\ColorService.cs", "/// <summary>Colors in CRM.</summary>`npublic sealed class ColorService : CrmOperationBase, IColorService`n{`n    public Task<Color> GetAsync(Guid id, CancellationToken cancellationToken)`n    {`n        try { return Retrieve(id); } catch (Exception) { throw; }`n    }`n    // $('x' * 210)`n}`n")
+    [IO.File]::WriteAllText("$cdmsR\src\Functions\ColorFunction.cs", "/// <summary>Color endpoints.</summary>`npublic sealed class ColorFunction`n{`n    /// <summary>Gets a color.</summary>`n    /// <param name=""req"">The request.</param>`n    /// <returns>The response.</returns>`n    [Function(""GetColor"")]`n    public async Task<HttpResponseData> Get([HttpTrigger(AuthorizationLevel.Function, ""get"")] HttpRequestData req)`n    {`n        try { return await _dispatcher.Send(new GetColorQuery()); }`n        catch (AppValidationException ex) { return req.CreateResponse(HttpStatusCode.BadRequest); }`n    }`n}`n")
+    $rc = J (PS51 $helper review -Repo $cdmsR)
+    $rcr = @($rc.findings | ForEach-Object { "$($_.rule)/$($_.severity)" })
+    Check ($rc.profile -eq 'cdms' -and $rc.scope -match 'uncommitted changes against HEAD only' -and $rcr -contains 'xml-doc-missing/error' -and $rcr -contains 'line-length/error' -and $rcr -contains 'broad-catch/warning' -and $rcr -notcontains 'redundant-validation-conversion/error') 'review (CDMS): missing XML documentation and lines over 200 characters are errors, a broad catch is a warning; without exception middleware a function''s own conversion is not called redundant' ($rcr -join ', ')
+    $bb1 = PS51 $helper review -Repo $dab -Base '--output=x'; $bb2 = PS51 $helper review -Repo $dab -Base no-such-branch
+    Check ($bb1.code -ne 0 -and $bb1.out -match 'not a valid branch' -and $bb2.code -ne 0 -and $bb2.out -match 'not found') 'review: -Base is validated before it reaches git (no option injection), and an unknown base is an error'
+
+    # The agent text stays project-agnostic and routes every repository through its profile.
+    Check ($agent -match '(?m)^## 1a\. Repository profile and source grounding' -and $agent -match 'profile -Repo <id>' -and $agent -match 'neverLoad' -and $agent -match 'wrong-solution' -and $agent -match 'never from feature or entity names' -and $agent -match 'UNVERIFIED' -and $agent -match 'Examples in instruction and skill files are patterns') 'agent: section 1a selects the profile from repository evidence, loads only its files, guards commands, and forbids invented code'
+    Check ($agent -match 'review -Repo <id> -Base <base branch>' -and $agent -match '\*\*Ready\*\* \(status DONE\)' -and $agent -match '\*\*Ready with Warnings\*\*' -and $agent -match '\*\*Not Ready\*\*' -and $agent -match 'a local build never counts as a SonarCloud result' -and $agent -match '"Implement this requirement"' -and $agent -match '"Fix PR comments"' -and $agent -match '"Review changes"' -and $agent -match '"Run tests"') 'agent: pre-PR review, Ready / Ready with Warnings / Not Ready completion gate, and the Implement, Fix PR comments, Review changes, and Run tests requests'
+    $pj = Get-Content (Join-Path $Source 'copilot\modules\profiles\profiles.json') -Raw | ConvertFrom-Json
+    $pfiles = @(@($pj.shared.skills) + @($pj.shared.onDemand.PSObject.Properties | ForEach-Object { $_.Name }) + @($pj.profiles | ForEach-Object { @($_.skills) + @($_.sonarRules) }))
+    $pmiss = @($pfiles | Where-Object { -not (Test-Path (Join-Path $Source "copilot\modules\profiles\$_")) })
+    $nofm = @($pfiles | Where-Object { $_ -notmatch '(^skills/[a-z]+/[a-z-]+/guide\.md|^instructions/[a-z]+/sonar-rules\.instructions\.md)$' -or (Get-Content (Join-Path $Source "copilot\modules\profiles\$_") -Raw) -notmatch '^# .+\r?\n\r?\n> Profile (skill `[a-z-]+`|rules): .+' })
+    $dabFiles = @($pj.profiles | Where-Object { $_.id -eq 'dab' } | ForEach-Object { @($_.skills) + @($_.sonarRules) }); $cdmsFiles = @($pj.profiles | Where-Object { $_.id -eq 'cdms' } | ForEach-Object { @($_.skills) + @($_.sonarRules) })
+    $sharedText = (@(@($pj.shared.skills) + @($pj.shared.onDemand.PSObject.Properties | ForEach-Object { $_.Name }) | ForEach-Object { Get-Content (Join-Path $Source "copilot\modules\profiles\$_") -Raw }) -join "`n")
+    Check (-not $pmiss.Count -and -not $nofm.Count -and $dabFiles.Count -eq 8 -and $cdmsFiles.Count -eq 10 -and -not @($dabFiles | Where-Object { $_ -notmatch '/dab/' }).Count -and -not @($cdmsFiles | Where-Object { $_ -notmatch '/cdms/' }).Count -and $sharedText -notmatch $agnostic) 'profiles: every listed file exists with its name and purpose in the header (no front matter, no SKILL.md, so no skill scanner picks it up); DAB and CDMS files live in separate folders; the shared skills name no project' (($pmiss + $nofm) -join ', ')
+
+    Check ($agent -match '(?m)^## Fast development' -and $agent -match 'affected -Repo <id>' -and $agent -match 'never a skipped stage D' -and $agent -match 'Remote queries twice, not per edit' -and $agent -match 'exact: true' -and $agent -match 'correctness wins') 'agent: fast development (exact names first, staged tests via affected, remote Sonar twice, correctness first)'
+    Check ($agent -match '\*\*Review-only / plan-first\*\*' -and $agent -match 'No application code changes until the developer approves' -and $agent -match 'do not add approval prompts' -and $agent -match 'decision table of the business rule branch coverage skill' -and $agent -match 'A rule with one branch implemented is EXTEND' -and $agent -match 'single-use-abstraction') 'agent: review-only and plan-first requests stop before code; business rules checked branch by branch; completion gate covers abstractions and error contracts'
+    $known = @(@($pj.shared.skills) + @($pj.shared.onDemand.PSObject.Properties | ForEach-Object { $_.Name }) + @($pj.profiles | ForEach-Object { $_.skills }))
+    $badRoute = @($pj.profiles | ForEach-Object { $pr = $_; @($pr.core) + @($pr.triggers.PSObject.Properties | ForEach-Object { $_.Name }) | Where-Object { @($pr.skills) -notcontains $_ } }) + @($pj.profiles | ForEach-Object { $pr = $_; @($pr.skills | Where-Object { @($pr.core) -notcontains $_ -and -not $pr.triggers.$_ }) })
+    Check (-not $badRoute.Count -and $known.Count -eq 19) 'profiles: every core and trigger entry is one of that profile''s own skills, and every skill is either core or has a trigger (no skill unreachable)' ($badRoute -join ', ')
+    $g = { param($f) Get-Content (Join-Path $Source "copilot\modules\profiles\$f") -Raw }
+    $sg = & $g 'skills/shared/source-grounded-development/guide.md'; $pr = & $g 'skills/shared/pre-pr-review/guide.md'; $br = & $g 'skills/shared/business-rule-branch-coverage/guide.md'
+    $dabA = & $g 'skills/dab/architecture/guide.md'; $cdmsA = & $g 'skills/cdms/architecture/guide.md'
+    $cats = 'Naming', 'business validation in the wrong layer', 'exception handling', 'unnecessary collaborators', 'duplicate interfaces', 'registration', 'query owned by the wrong layer', 'XML documentation', 'missing tests', 'Sonar', 'breaking API contract', 'uncovered business decision branches'
+    $missCat = @($cats | Where-Object { $pr -notmatch [regex]::Escape($_) })
+    Check (-not $missCat.Count -and $pr -match 'disposition' -and $pr -match 'searched for in the rest of the feature' -and $pr -match 'Review-only or plan-first') 'pre-PR review: the twelve reusable review categories, a disposition per comment, recurring problems searched across the feature, review-only stops' ($missCat -join ', ')
+    Check ($sg -match '## Validation ownership' -and $sg -match 'a validator never changes state' -and $sg -match 'Not every\s+rule belongs in a validator' -and $sg -match '\*\*Before adding\*\*' -and $sg -match '\*\*Before removing\*\*' -and $sg -match 'reflection, assembly scanning' -and $sg -match '## Search order and when to stop') 'source grounding: validation ownership, abstraction add/remove checks, search order with a stop rule'
+    Check ($br -match 'Yes/No' -and $br -match 'state transitions' -and $br -match 'transaction boundaries' -and $br -match 'COVERED' -and $br -match 'PARTIAL' -and $br -match 'never invent' -and $br -match 'no runtime dependency on the legacy platform' -and $br -notmatch $agnostic) 'branch coverage skill: decision table over every path kind, evidence-based status, legacy rules ported without runtime dependency, project-agnostic'
+    Check ($dabA -match 'There is no separate DAB plugin' -and $dabA -match 'Never add a CRM runtime dependency' -and $cdmsA -match 'Plugin-owned behavior' -and $cdmsA -match 'DAB GraphQL and DAB\s+exception-handling conventions do not apply') 'profiles: DAB implements approved legacy-derived rules in DAB code without CRM dependencies; CDMS keeps plugin-owned behavior and stays separate from DAB conventions'
+    $dabSonar = Get-Content (Join-Path $Source 'copilot\modules\profiles\instructions\dab\sonar-rules.instructions.md') -Raw; $cdmsSonar = Get-Content (Join-Path $Source 'copilot\modules\profiles\instructions\cdms\sonar-rules.instructions.md') -Raw
+    Check ($cdmsSonar -match 'S2360' -and $cdmsSonar -match '200 characters' -and $cdmsSonar -match 'S927' -and $dabSonar -notmatch 'S2360' -and $dabSonar -match 'Not DAB requirements unless' -and $dabSonar -match 'Local compilation does not prove remote SonarCloud success' -and $cdmsSonar -match 'policy') 'Sonar: separate DAB and CDMS catalogs; CDMS-only rules are not DAB requirements; policy items are marked as policy; local builds are not SonarCloud results'
+
+    # Upgrades keep the developer's profile files; an edited installed file is backed up and reported before it is replaced.
+    $instSonar = "$home2\.akzo-agent\modules\profiles\instructions\dab\sonar-rules.instructions.md"
+    Add-Content $instSonar '- my local edit'
+    $ri = PS51 $install -HomeRoot $home2
+    Check ($ri.code -eq 0 -and $ri.out -match 'was edited after it was installed' -and (Get-Content $instSonar -Raw) -notmatch 'my local edit' -and (Get-Content $custom -Raw) -match 'team CDMS rules' -and @(Get-ChildItem "$home2\.akzo-agent\backups" -Recurse -Filter 'sonar-rules.instructions.md' | Where-Object { (Get-Content $_.FullName -Raw) -match 'my local edit' }).Count) 'upgrade: profiles-custom is never touched; an installed profile file edited by hand is backed up with a warning, then restored'
+    $rvv = PS51 $install -HomeRoot $home2 -Verify
+    Check ($rvv.out -match 'PROFILES: dab \(7 skills \+ Sonar rules\), cdms \(9 skills \+ Sonar rules\), shared \(3 skills\); 21 of 21 files installed; 1 custom file' -and $rvv.out -match 'VERIFY OK') 'verify: every profile file is installed and the custom files are counted (skill discovery goes through the helper, not a Copilot skills folder)'
+
     # ---- Sonar: setup detection (no network), read-only server queries against a local stand-in, changed-line coverage.
     $savedSonar = @($env:SONAR_TOKEN, $env:SONAR_HOST_URL); $env:SONAR_TOKEN = $null; $env:SONAR_HOST_URL = $null
     try {

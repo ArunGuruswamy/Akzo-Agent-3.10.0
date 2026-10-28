@@ -39,12 +39,12 @@ footer{max-width:960px;margin:0 auto;padding:0 16px 32px;color:var(--muted);font
 <body>
 <header><div>
   <h1>Akzo SDD agent for GitHub Copilot</h1>
-  <p style="font-weight:600;margin:0 0 6px">Akzo Master SDD Agent v3.5.0 (release candidate) — Developed and maintained by Arun RG</p>
+  <p style="font-weight:600;margin:0 0 6px">Akzo Master SDD Agent v3.7.0 (release candidate) — Developed and maintained by Arun RG</p>
   <p>Install, configure, and use the <code>akzo-master-sdd</code> custom agent in VS Code and Visual Studio 2026. Everything below matches the scripts in this repository.</p>
 </div></header>
 <nav aria-label="Sections">
   <a href="#prereq">Prerequisites</a><a href="#isolation">Activation &amp; isolation</a><a href="#install">Install</a><a href="#vscode">VS Code</a><a href="#vs">Visual Studio</a>
-  <a href="#repos">Repositories</a><a href="#security">Security (G8)</a><a href="#workflow">Tasks &amp; branches</a><a href="#memory">Memory &amp; Auto Mode</a><a href="#sonar">SonarQube</a><a href="#quick">Quick start</a><a href="#task">Start a task</a><a href="#use">Prompts</a><a href="#access">Permissions</a><a href="#storage">Storage</a><a href="#git">Git Changes</a>
+  <a href="#repos">Repositories</a><a href="#security">Security (G8)</a><a href="#workflow">Tasks &amp; branches</a><a href="#profiles">DAB &amp; CDMS</a><a href="#memory">Memory &amp; Auto Mode</a><a href="#sonar">SonarQube</a><a href="#quick">Quick start</a><a href="#task">Start a task</a><a href="#use">Prompts</a><a href="#access">Permissions</a><a href="#storage">Storage</a><a href="#git">Git Changes</a>
   <a href="#update">Update &amp; uninstall</a><a href="#trouble">Troubleshooting</a><a href="#evaluation">Evaluation</a>
 </nav>
 <main>
@@ -213,6 +213,26 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\.akzo-agen
     <li><b>Specs:</b> one folder per work item, <code>&lt;specsDir&gt;\&lt;id&gt;-&lt;title&gt;\spec.md</code> and <code>plan.md</code>. Another PBI's folder is never reused (<code>SPEC_LOCATION_TAKEN</code>); resuming on a branch that lacks the PBI's spec stops with <code>WRONG_BRANCH</code>.</li>
     <li><b>Modify:</b> the current spec, plan, PBI, inputs, and statuses are copied to <code>&lt;task&gt;\history\</code> first; then the changed parts go through the gates again.</li>
     <li><b>Upgrading from 3.4.x:</b> existing tasks resume with their specs and approvals; for tasks without a recorded branch decision the agent reports that and asks before changing code.</li>
+  </ul>
+</section>
+
+<section id="profiles">
+  <h2>Repository profiles: DAB and CDMS</h2>
+  <p>The agent identifies the repository before it reads code for a change, and loads only that repository's rules. The helper decides from the solution file, never from feature names:</p>
+  <table>
+    <tr><th>Profile</th><th>Repository</th><th>Selected when</th><th>Loads</th></tr>
+    <tr><td>dab</td><td>AN.ColorAppsAzure.BL</td><td><code>AN.ColorAppsAzure.BL.sln</code> is in the repository</td><td>7 DAB skills and the DAB Sonar rules</td></tr>
+    <tr><td>cdms</td><td>ColorDMS</td><td><code>AN.ColorAppsAzure.BL.ColorDMS.sln</code> is in the repository</td><td>9 CDMS skills and the CDMS Sonar rules</td></tr>
+  </table>
+  <ul>
+    <li>Both also load the shared <b>source-grounded development</b> and <b>pre-PR review</b> skills. Both solutions in one repository: the agent asks which one. Package or code hints without the solution: no profile is applied.</li>
+    <li>The other profile's files are never loaded, and a <code>dotnet</code> command naming another repository's solution is refused by the command guard.</li>
+    <li>Before handover the agent runs the pre-PR review on the branch. It reports the six recorded PR review findings: validation-exception conversion in PUT and POST functions that the middleware already handles, duplicate changes, a validator off the FluentValidation pattern, misplaced command or query dependencies, and missing or outdated XML documentation. It also reports the CDMS 200-character line limit and broad catches. Errors must be fixed before <b>Ready</b>.</li>
+    <li><b>Your team's own rule files:</b> save them under <code>%USERPROFILE%\.akzo-agent\profiles-custom\</code> with the same relative path as the shipped file, for example <code>profiles-custom\instructions\cdms\sonar-rules.instructions.md</code>. The agent then uses yours; upgrades never change that folder. <code>Install-MasterAgent.cmd</code> &gt; Verify (or <code>install.ps1 -Verify</code>) lists how many profile files are installed and how many custom files you have.</li>
+    <li><b>Only what the request needs (3.7.0):</b> the agent passes the request to <code>profile -Query</code>. It loads the shared skills, the profile's core skills, the Sonar rules, and the skills that match the request (for example FluentValidation for a validator change). The rest is listed as <i>deferred</i> and read when the work reaches it. A new shared skill, <b>business rule branch coverage</b>, checks every approved rule path by path. Detection is cached per repository and refreshed after any commit, checkout, or edit. The cache lives in <code>maps\&lt;repo&gt;\profile-detection.json</code> and is safe to delete.</li>
+    <li><b>Staged tests (3.7.0):</b> <code>affected -Repo &lt;id&gt; [-Base main]</code> tells the agent which projects to build and which tests to run after each edit (focused, then dependent test projects). The full suite with coverage runs once, at the final gate. Changes to the solution, props, or package files always mean the full build and suite.</li>
+    <li><b>Review-only or plan-first requests</b> (<i>"review this and propose a fix before changing anything"</i>) end with the analysis and proposed changes. Nothing is edited until you approve.</li>
+    <li>Chat requests: <i>Implement this requirement</i>, <i>Fix PR comments</i>, <i>Review changes</i>, <i>Run tests</i>. Results are reported as Ready, Ready with Warnings (something could not be verified, for example SonarCloud), or Not Ready.</li>
   </ul>
 </section>
 
@@ -409,7 +429,7 @@ notepad "$task\refined-pbi.md"</pre></div>
 <section id="update">
   <h2>Update and uninstall</h2>
   <h3>Update</h3>
-  <p>Get the latest Akzo-Agent files, then double-click <b>Install-MasterAgent.cmd</b> &gt; <b>Install / Upgrade</b> (or re-run the installer). Unchanged files are skipped; replaced and removed files are backed up.</p>
+  <p>Get the latest Akzo-Agent files, then double-click <b>Install-MasterAgent.cmd</b> &gt; <b>Install / Upgrade</b> (or re-run the installer). Unchanged files are skipped; replaced and removed files are backed up. Upgrading keeps <code>repos.json</code>, authorizations, tasks, repository memory, and <code>profiles-custom</code>. From 3.6.0 to 3.7.0 nothing needs re-authorizing or re-indexing. The first call per repository builds the profile cache. If you customized a profile file, compare it with the shipped 3.7.0 version (new sections in the shared skills and the DAB/CDMS architecture skills).</p>
   <div class="cmd"><pre>powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1</pre></div>
   <h3>Uninstall</h3>
   <p>Double-click <b>Uninstall-MasterAgent.cmd</b> and confirm, or use the commands below. Removes the agent files, helper, and templates recorded in the install manifest (backing up any you edited) and the VS Code settings block added by <code>-ConfigureVSCode</code>. Keeps <code>repos.json</code>, tasks, maps, graphs, and backups.</p>

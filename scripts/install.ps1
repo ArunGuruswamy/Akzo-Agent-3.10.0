@@ -229,7 +229,7 @@ function Get-VSCodeBlock([string]$text) {
     $helper = Join-Path $ModulesDir 'investigate\scripts\akzo.ps1'
     # Only the helper, only its own commands, and no characters that could chain or substitute another command.
     $rx = '^(powershell|pwsh)(\.exe)? -NoProfile -ExecutionPolicy Bypass -File "?' + ([regex]::Escape($helper) -replace '\\\\', '[\\/]') +
-        '"? (home|registry|state|inbox|pick|intake|attach|role|discover|task|graph|sonar|coverage|context|remember|forget|policy|guard|scan|security|branchinfo|tasks|snapshot)\b([^;&|`$<>\r\n"]|"[^"&|`$<>\r\n]*")*$'   # ';' only inside "..." (path lists)
+        '"? (home|registry|state|inbox|pick|intake|attach|role|discover|task|graph|sonar|coverage|context|remember|forget|policy|guard|scan|security|branchinfo|tasks|snapshot|profile|review|affected)\b([^;&|`$<>\r\n"]|"[^"&|`$<>\r\n]*")*$'   # ';' only inside "..." (path lists)
     $rest = [regex]::Replace($text, $BlockRx, '')
     $lines = @()
     if ($rest -notmatch '"chat\.tools\.terminal\.autoApprove"') {
@@ -368,6 +368,16 @@ if ($Verify) {
             if (-not (Test-Path $ref)) { Write-Output "MISSING MODULE $ref (referenced by $($m.path))"; $problems++ }
         }
     }
+    # Repository profiles: every file profiles.json lists is installed, so the helper's 'profile' command can hand it to the agent.
+    $pj = Join-Path $ModulesDir 'profiles\profiles.json'
+    if (Test-Path $pj) {
+        $pdefs = Get-Content $pj -Raw | ConvertFrom-Json
+        $plist = @(@($pdefs.shared.skills) + @($pdefs.shared.onDemand.PSObject.Properties | ForEach-Object { $_.Name }) + @($pdefs.profiles | ForEach-Object { @($_.skills) + @($_.sonarRules) }) | Where-Object { $_ })
+        $pmiss = @($plist | Where-Object { -not (Test-Path (Join-Path $ModulesDir "profiles\$_")) })
+        foreach ($m in $pmiss) { Write-Output "MISSING PROFILE FILE $m"; $problems++ }
+        $custom = @(Get-ChildItem (Join-Path $AkzoHome 'profiles-custom') -Recurse -File -ErrorAction SilentlyContinue)
+        Write-Output "PROFILES: $(@($pdefs.profiles | ForEach-Object { "$($_.id) ($(@($_.skills).Count) skills + Sonar rules)" }) -join ', '), shared ($(@($pdefs.shared.skills).Count + @($pdefs.shared.onDemand.PSObject.Properties).Count) skills); $($plist.Count - $pmiss.Count) of $($plist.Count) files installed; $($custom.Count) custom file(s) in $AkzoHome\profiles-custom"
+    } else { Write-Output 'MISSING PROFILE FILE profiles.json'; $problems++ }
     Write-Output "ISOLATION: helper and templates in $ModulesDir (not a Copilot discovery folder); agent files are the only discovered Akzo files."
     # Visual Studio reads user-level agents (%USERPROFILE%\.github\agents) only from 2026 version 18.5; 2022 has no custom agents.
     $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
@@ -439,6 +449,8 @@ if ($Uninstall) {
         foreach ($dest in $desired.Keys) {
             $bytes = $desired[$dest]
             if ((Test-Path $dest) -and (Get-FileSha $dest) -eq (Get-Hash $bytes)) { $counts.unchanged++; continue }
+            $was = $old | Where-Object { $_.path -eq $dest } | Select-Object -First 1
+            if ($was -and (Test-Path $dest) -and (Get-FileSha $dest) -ne $was.sha256) { Write-Warning "$dest was edited after it was installed; your version is backed up. Keep custom profile rules in $AkzoHome\profiles-custom, which upgrades never touch." }
             if (Test-Path $dest) { Backup $dest }
             Say "write   $dest"
             if (-not $DryRun) {

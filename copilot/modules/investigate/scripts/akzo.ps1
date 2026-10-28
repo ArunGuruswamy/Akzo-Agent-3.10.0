@@ -32,6 +32,10 @@
   akzo.ps1 sonar -Repo backend-functions -Check gate -Branch feature/x   # read-only server query, token from SONAR_TOKEN
   akzo.ps1 sonar -Repo backend-functions -Check issues -File "src/A.cs;src/B.cs" -NewCode
   akzo.ps1 sonar -Repo backend-functions -Check rule -Key csharpsquid:S3776
+  akzo.ps1 profile -Repo backend-functions             # repository development profile (DAB / CDMS / none) and the files to load
+  akzo.ps1 review -Repo backend-functions -Base main   # pre-PR review of the branch: recorded PR regression scenarios, profile rules
+  akzo.ps1 profile -Repo backend-functions -Query "change the order validator"   # only the profile files this request needs; the rest listed as deferred
+  akzo.ps1 affected -Repo backend-functions -Base main # staged tests: build, focused, affected regression, full suite once
   akzo.ps1 coverage -Repo backend-functions -Report "C:\...\evidence\coverage.cobertura.xml"   # coverage of changed lines
   akzo.ps1 context -Repo backend-functions -Query "validate gloss measurement range" -Mode balanced   # ranked files, symbols, facts
   akzo.ps1 remember -Repo backend-functions -Type validation -Text "Input rules live in FluentValidation validators next to the command" -Evidence "src/Orders/CreateOrderValidator.cs:7" -Pbi 305912
@@ -41,7 +45,7 @@
 #>
 param(
     [Parameter(Position = 0, Mandatory = $true)]
-    [ValidateSet('home', 'registry', 'state', 'inbox', 'pick', 'intake', 'attach', 'role', 'discover', 'task', 'graph', 'sonar', 'coverage', 'remember', 'forget', 'context', 'policy', 'authorize', 'guard', 'scan', 'security', 'purge', 'branchinfo', 'branchcreate', 'branchuse', 'tasks', 'snapshot')]
+    [ValidateSet('home', 'registry', 'state', 'inbox', 'pick', 'intake', 'attach', 'role', 'discover', 'task', 'graph', 'sonar', 'coverage', 'remember', 'forget', 'context', 'policy', 'authorize', 'guard', 'scan', 'security', 'purge', 'branchinfo', 'branchcreate', 'branchuse', 'tasks', 'snapshot', 'profile', 'review', 'affected')]
     [string]$Command,
     [string]$Reference,       # authorize: the approval you hold (ticket, policy, or approver)
     [string]$Classification,  # authorize: public | internal | confidential (restricted needs an administrator policy)
@@ -56,7 +60,7 @@ param(
     [switch]$Confirmed,       # purge: required, the deletion cannot be undone
     [switch]$IncludeTasks,    # purge: also delete the repository's task folders
     [string]$Name,            # branchcreate / branchuse: the branch name
-    [string]$Base,            # branchcreate: the base branch the developer confirmed
+    [string]$Base,            # branchcreate: the base branch the developer confirmed; review: the branch the change will merge into
     [switch]$AllowDirty,      # branchcreate / branchuse: the developer agreed to switch with uncommitted changes (git never discards them)
     [switch]$Resume,          # intake: the developer chose to resume / modify an existing task (without it an existing task id is reported, not reused)
     [string]$Type,         # remember: fact type
@@ -70,7 +74,7 @@ param(
     [string]$Check = '',   # sonar: which read-only server query
     [string]$Branch,
     [string]$PullRequest,
-    [string]$Key,          # sonar -Check rule: the rule key, e.g. csharpsquid:S3776
+    [string]$Key,          # sonar -Check rule: the rule key, e.g. csharpsquid:S3776; profile / review: the profile to confirm (e.g. cdms)
     [string]$Report,       # coverage: Cobertura or LCOV reports joined with ';'
     [switch]$NewCode,
     [string]$Supporting,   # several paths joined with ';'
@@ -856,9 +860,9 @@ function Invoke-SonarApi([string]$hostUrl, [string]$apiPath) {
 }
 
 # Lines added or changed against HEAD per repo-relative path (tracked edits and untracked files).
-function Get-ChangedLines([string]$root) {
+function Get-ChangedLines([string]$root, [string]$against = 'HEAD') {   # working tree against HEAD, or against a commit (review -Base)
     $map = @{}; $cur = $null
-    foreach ($l in @(Invoke-Quiet git -C $root -c core.quotepath=off diff -U0 --no-color --no-ext-diff HEAD)) {
+    foreach ($l in @(Invoke-Quiet git -C $root -c core.quotepath=off diff -U0 --no-color --no-ext-diff $against)) {
         if ($l -match '^\+\+\+ (.+)$') {
             $cur = if ($Matches[1] -eq '/dev/null') { $null } else { $Matches[1] -replace '^b/', '' }
             if ($cur -and -not $map.ContainsKey($cur)) { $map[$cur] = New-Object Collections.Generic.List[int] }
@@ -1239,6 +1243,352 @@ function Test-BranchName([string]$n) {
     try { & git check-ref-format --branch $n 2>&1 | Out-Null; $ok = ($LASTEXITCODE -eq 0) } finally { $ErrorActionPreference = $keep }
     $ok
 }
+# Repository development profiles (modules\profiles\profiles.json). At most one profile applies, and only when its
+# solution file is in the repository; package, file, and code markers are supporting evidence, never enough alone.
+$ProfilesDir = Join-Path $ModulesDir 'profiles'
+$CustomProfilesDir = Join-Path $AkzoHome 'profiles-custom'   # the developer's own versions; the installer never writes here
+function Read-Profiles {
+    $p = Join-Path $ProfilesDir 'profiles.json'
+    if (-not (Test-Path -LiteralPath $p)) { return $null }
+    Get-Content -LiteralPath $p -Raw -Encoding UTF8 | ConvertFrom-Json
+}
+function Get-ProfileFile([string]$rel) {   # a file with the same relative path under profiles-custom wins
+    $c = Join-Path $CustomProfilesDir $rel; $s = Join-Path $ProfilesDir $rel
+    if (Test-Path -LiteralPath $c) { return [pscustomobject][ordered]@{ file = $rel; path = $c; source = 'custom' } }
+    [pscustomobject][ordered]@{ file = $rel; path = $s; source = $(if (Test-Path -LiteralPath $s) { 'shipped' } else { 'MISSING' }) }
+}
+function Get-ProfileCacheKey($r, [string]$defsText) {   # HEAD + working-tree status + size/time of every changed file + the profile definitions
+    $ErrorActionPreference = 'Continue'
+    $sb = New-Object Text.StringBuilder
+    [void]$sb.Append((Get-TextHash $defsText)).Append("`n")
+    # One git process: porcelain v2 carries HEAD ('# branch.oid') and every changed, staged, renamed, or untracked path.
+    foreach ($l in @(git -C $r.path -c core.quotepath=off status --porcelain=v2 --branch -uall 2>$null)) {
+        [void]$sb.Append($l)
+        $rel = switch ($l[0]) { '1' { $l.Split(' ', 9)[8] } '2' { $l.Split(' ', 10)[9].Split("`t")[0] } 'u' { $l.Split(' ', 11)[10] } '?' { $l.Substring(2) } default { '' } }
+        $f = if ($rel) { Join-Path $r.path ($rel -replace '^"|"$', '') } else { '' }
+        if ($f -and (Test-Path -LiteralPath $f -PathType Leaf)) { $i = Get-Item -LiteralPath $f; [void]$sb.Append("|$($i.Length)|$($i.LastWriteTimeUtc.Ticks)") }
+        [void]$sb.Append("`n")
+    }
+    Get-TextHash $sb.ToString()
+}
+function Get-RepoProfile($r, [string]$want, [string]$intent) {
+    $defs = Read-Profiles
+    if (-not $defs) { return [pscustomobject][ordered]@{ status = 'NO_PROFILES_INSTALLED'; repo = $r.id; profile = ''; solutions = @(); detail = "no profiles.json under $ProfilesDir" } }
+    # Detection is cached per repository; any commit, checkout, edit, new or deleted file, or profile change misses the cache.
+    $cacheDir = Join-Path $AkzoHome "maps\$($r.id)"; $cacheFile = Join-Path $cacheDir 'profile-detection.json'
+    $key = Get-ProfileCacheKey $r ([IO.File]::ReadAllText((Join-Path $ProfilesDir 'profiles.json')))
+    $cached = Read-JsonOrRecover $cacheFile
+    $cacheEvent = if ($cached.recovered) { 'recovered' } else { 'miss' }
+    if ($cached.data -and $cached.data.schema -eq 1 -and $cached.data.key -eq $key) {
+        $cacheEvent = 'hit'; $slns = @($cached.data.solutions | Where-Object { $_ })
+        $found = @(foreach ($c in @($cached.data.found)) { [pscustomobject]@{ def = @($defs.profiles | Where-Object { $_.id -eq $c.id })[0]; solution = "$($c.solution)"; evidence = @($c.evidence | Where-Object { $_ }) } })
+    } else {
+    $files =@(Invoke-Quiet git -C $r.path -c core.quotepath=off ls-files --cached --others --exclude-standard)
+    $slns = @($files | Where-Object { $_ -match '\.slnx?$' })
+    $projText = (@($files | Where-Object { $_ -match '\.(cs|fs|vb)proj$|(^|/)(Directory\.Packages\.props|packages\.config)$' } | Select-Object -First 300 | ForEach-Object {
+                try { [IO.File]::ReadAllText((Join-Path $r.path $_)) } catch { '' } }) -join "`n")
+    $found = @(foreach ($d in @($defs.profiles)) {
+            $sln = $slns | Where-Object { ($_ -split '/')[-1] -ieq $d.solution } | Select-Object -First 1
+            $ev = New-Object Collections.Generic.List[string]
+            if ($sln) { $ev.Add("solution $sln") }
+            foreach ($p in @($d.markers.packages | Where-Object { $_ })) { $m = [regex]::Match($projText, 'Include="(' + [regex]::Escape($p) + '[^"]*)"'); if ($m.Success) { $ev.Add("package $($m.Groups[1].Value)") } }
+            foreach ($x in @($d.markers.files | Where-Object { $_ })) { $hit = $files | Where-Object { $_ -match $x } | Select-Object -First 1; if ($hit) { $ev.Add("file $hit") } }
+            foreach ($t in @($d.markers.code | Where-Object { $_ })) { $hit = @(Invoke-Quiet git -C $r.path -c core.quotepath=off grep -l --untracked -w -F $t -- '*.cs') | Select-Object -First 1; if ($hit) { $ev.Add("code '$t' in $hit") } }
+            [pscustomobject]@{ def = $d; solution = "$sln"; evidence = $ev.ToArray() }
+        })
+    try {   # the cache is optional: a failed write only costs the next call a detection
+        New-Item -ItemType Directory -Force -Path $cacheDir | Out-Null; Protect-Directory $cacheDir | Out-Null
+        Write-TextAtomic $cacheFile ([pscustomobject]@{ schema = 1; key = $key; solutions = $slns; found = @($found | ForEach-Object { [pscustomobject]@{ id = $_.def.id; solution = $_.solution; evidence = $_.evidence } }) } | ConvertTo-Json -Depth 4)
+    } catch { }
+    }
+    $withSln = @($found | Where-Object { $_.solution })
+    $pick = $null
+    if ($want) {
+        $asked = $found | Where-Object { $_.def.id -eq $want } | Select-Object -First 1
+        if (-not $asked) { throw "Unknown profile '$want' (known: $(@($defs.profiles | ForEach-Object { $_.id }) -join ', '))." }
+        if ($asked.solution) { $pick = $asked; $status = 'CONFIRMED' } else { $status = 'NOT_CONFIRMED' }
+    } elseif ($withSln.Count -eq 1) { $pick = $withSln[0]; $status = 'DETECTED' }
+    elseif ($withSln.Count -gt 1) { $status = 'AMBIGUOUS' }
+    elseif (@($found | Where-Object { $_.evidence.Count -ge 2 }).Count) { $status = 'UNCERTAIN' }   # one common package alone is no hint
+    else { $status = 'NO_PROFILE' }
+    $o = [ordered]@{ status = $status; repo = $r.id; profile = ''; name = ''; solution = ''; evidence = @()
+        solutions = @($slns | ForEach-Object { ($_ -split '/')[-1] } | Select-Object -Unique)
+        candidates = @($found | Where-Object { $_.evidence.Count } | ForEach-Object { [pscustomobject][ordered]@{ profile = $_.def.id; solution = "$($_.solution)"; evidence = $_.evidence } }) }
+    $o.cache = $cacheEvent
+    # Lazy loading: with -Query only the core files and the files whose topic matches the request are loaded; the rest of
+    # the same profile is 'deferred' (read when the work reaches that topic). Without -Query everything is loaded.
+    $onDemand = @{}; if ($defs.shared.onDemand) { foreach ($pp in $defs.shared.onDemand.PSObject.Properties) { $onDemand[$pp.Name] = $pp.Value } }
+    $wanted = { param($file, $rx) (-not $intent) -or ($rx -and $intent -match "(?i)$rx") }
+    $shared = @(@($defs.shared.skills | Where-Object { $_ }) + @($onDemand.Keys | Sort-Object | Where-Object { & $wanted $_ $onDemand[$_] }))
+    $deferred = @($onDemand.Keys | Sort-Object | Where-Object { -not (& $wanted $_ $onDemand[$_]) })
+    if ($pick) {
+        $d = $pick.def
+        $dir = if ($pick.solution -match '/') { Join-Path $r.path (($pick.solution -replace '/[^/]+$', '') -replace '/', '\') } else { $r.path }
+        $missing = @($d.commandFiles | Where-Object { $_ -and -not (Test-Path -LiteralPath (Join-Path $dir $_)) })
+        $o.profile = $d.id; $o.name = $d.name; $o.solution = $pick.solution; $o.evidence = $pick.evidence
+        $core = @($d.core | Where-Object { $_ })
+        $mine = @($d.skills | Where-Object { $_ -and (-not $intent -or $core -contains $_ -or (& $wanted $_ $d.triggers.$_)) })
+        $deferred += @($d.skills | Where-Object { $_ -and $mine -notcontains $_ })
+        $o.load = @(@($shared) + $mine + @($d.sonarRules) | Where-Object { $_ } | ForEach-Object { Get-ProfileFile $_ })
+        $o.deferred = @($deferred | ForEach-Object { Get-ProfileFile $_ })
+        $o.neverLoad = @($defs.profiles | Where-Object { $_.id -ne $d.id } | ForEach-Object { @($_.skills) + @($_.sonarRules) } | Where-Object { $_ })
+        $o.otherSolutions = @($defs.profiles | Where-Object { $_.id -ne $d.id } | ForEach-Object { $_.solution })
+        $o.commands = [ordered]@{ workingDirectory = $dir; build = $d.commands.build; test = $d.commands.test; missingFiles = $missing; verified = (-not $missing.Count) }
+        $o.review = $d.review
+        $o.next = "Read every file in 'load' before investigating; read a 'deferred' file as soon as the work reaches its topic (when unsure, read it); never read or apply 'neverLoad'. Run 'commands' from workingDirectory$(if ($missing.Count) { " after checking $($missing -join ', ') (not found next to the solution)" })."
+    } else {
+        $o.load = @($shared | ForEach-Object { Get-ProfileFile $_ })
+        $o.deferred = @($deferred | ForEach-Object { Get-ProfileFile $_ })
+        $o.neverLoad = @($defs.profiles | ForEach-Object { @($_.skills) + @($_.sonarRules) } | Where-Object { $_ })
+        $o.next = switch ($status) {
+            'AMBIGUOUS' { "Solutions of several profiles are here ($(@($withSln | ForEach-Object { $_.solution }) -join ', ')). Ask the developer which solution the work belongs to, then run profile -Repo $($r.id) -Key <profile>. Load no profile files before that." }
+            'UNCERTAIN' { 'Profile markers were found but no profile solution file. Do not choose a profile from names or markers: follow the repository''s own patterns and the generic stack profiles, and tell the developer which solution was expected.' }
+            'NOT_CONFIRMED' { "The solution of profile '$want' is not in this repository, so that profile is not applied. Inspect the solution files and ask the developer." }
+            default { 'No repository profile applies: follow the repository''s own patterns and the generic stack profiles.' }
+        }
+    }
+    [pscustomobject]$o
+}
+function Test-SolutionUse($r, [string]$line) {   # a dotnet command names a solution of this repository, never another profile's
+    $named = @([regex]::Matches($line, '[^\s"''=;|&]+\.slnx?\b') | ForEach-Object { ($_.Value -split '[\\/]')[-1] } | Select-Object -Unique)
+    if (-not $named.Count) { return $null }
+    $p = Get-RepoProfile $r ''
+    foreach ($n in $named) {
+        if ($p.solutions -notcontains $n) { return [pscustomobject]@{ decision = 'BLOCK'; category = 'wrong-solution'; reason = "solution $n is not in repository $($r.id) (solutions here: $(@($p.solutions) -join ', '))" } }
+        $other = @((Read-Profiles).profiles | Where-Object { $_.solution -ieq $n -and $_.id -ne $p.profile })
+        if ($p.profile -and $other.Count) { return [pscustomobject]@{ decision = 'BLOCK'; category = 'wrong-solution'; reason = "solution $n belongs to the $($other[0].name) profile; repository $($r.id) is $($p.name)" } }
+    }
+    $null
+}
+
+function Get-ParamNames([string]$sig) {   # parameter names of the first parameter list in a C# signature
+    $open = $sig.IndexOf('('); if ($open -lt 0) { return @() }
+    $depth = 0; $buf = ''; $parts = New-Object Collections.Generic.List[string]
+    for ($k = $open + 1; $k -lt $sig.Length; $k++) {
+        $c = "$($sig[$k])"
+        if ($c -eq ')' -and $depth -eq 0) { break }
+        if ('(', '<', '[' -contains $c) { $depth++ } elseif (')', '>', ']' -contains $c) { $depth-- }
+        if ($c -eq ',' -and $depth -eq 0) { $parts.Add($buf); $buf = '' } else { $buf += $c }
+    }
+    if ($buf.Trim()) { $parts.Add($buf) }
+    @($parts | ForEach-Object { $x = (($_ -replace '\[[^\]]*\]', '') -replace '=.*$', '').Trim(); if ($x -match '(\w+)$') { $Matches[1] } })
+}
+
+# Pre-PR review: the recorded PR regression scenarios and the profile's rules, on the real diff (static; no build).
+function Get-ChangeBase($r, [string]$base) {   # what a change is compared with: HEAD, or the merge base of -Base and HEAD
+    if (-not $base) { return 'HEAD', 'uncommitted changes against HEAD only (committed work on the branch is not included; pass -Base <branch>)' }
+    if ($base -notmatch '^\w[\w./~^-]*$') { throw "-Base '$base' is not a valid branch or commit name." }
+    $mb = "$(Invoke-Quiet git -C $r.path merge-base $base HEAD)".Trim()
+    if (-not $mb) { throw "Base '$base' was not found, or has no common history with HEAD." }
+    $mb, "working tree against the merge base of $base and HEAD ($($mb.Substring(0, 10))): committed and uncommitted work"
+}
+function Get-AffectedTests($r, [string]$against) {   # staged test selection: changed files -> owning projects -> dependent test projects
+    $root = $r.path
+    $changed = @(@(Invoke-Quiet git -C $root -c core.quotepath=off diff --name-only $against) + @(Invoke-Quiet git -C $root -c core.quotepath=off ls-files -o --exclude-standard) | Where-Object { $_ } | Sort-Object -Unique)
+    $projFiles = @(Invoke-Quiet git -C $root -c core.quotepath=off ls-files --cached --others --exclude-standard -- '*.csproj' '*.fsproj' '*.vbproj' | Where-Object { Test-Path -LiteralPath (Join-Path $root $_) })
+    $proj = @{}
+    foreach ($pf in $projFiles) {
+        $text = try { [IO.File]::ReadAllText((Join-Path $root $pf)) } catch { '' }
+        $dir = if ($pf -match '/') { $pf -replace '/[^/]+$', '' } else { '' }
+        $refs = @(foreach ($m in [regex]::Matches($text, 'ProjectReference\s+Include="([^"]+)"')) {
+                $parts = New-Object Collections.Generic.List[string]; if ($dir) { $parts.AddRange([string[]]($dir -split '/')) }
+                foreach ($seg in ($m.Groups[1].Value -replace '\\', '/') -split '/') { if ($seg -eq '..') { if ($parts.Count) { $parts.RemoveAt($parts.Count - 1) } } elseif ($seg -and $seg -ne '.') { $parts.Add($seg) } }
+                $parts -join '/' })
+        $isTest = ($text -match 'Microsoft\.NET\.Test\.Sdk|"xunit|"NUnit|"MSTest|<IsTestProject>\s*true') -or ($pf -match '(?i)[./]tests?[^/]*\.\w+proj$')
+        $proj[$pf] = [pscustomobject]@{ path = $pf; dir = $dir; refs = $refs; test = $isTest }
+    }
+    $owner = { param($f) $best = $null; foreach ($k in $proj.Keys) { $d = $proj[$k].dir; if (($d -eq '' -or $f.StartsWith("$d/", [StringComparison]::OrdinalIgnoreCase)) -and ($null -eq $best -or $d.Length -gt $proj[$best].dir.Length)) { $best = $k } }; $best }
+    $direct = New-Object 'Collections.Generic.HashSet[string]'; $global = New-Object Collections.Generic.List[string]; $focus = @{}
+    foreach ($f in $changed) {
+        $o = if ($proj.ContainsKey($f)) { $f } else { & $owner $f }
+        if (-not $o -or ($proj[$o].dir -eq '' -and $f -notmatch '\.(cs|fs|vb)$')) { $global.Add($f); continue }   # build-wide files (solution, props, editorconfig, packages) narrow nothing
+        [void]$direct.Add($o)
+        if ($f -match '\.(cs|fs|vb)$') { $focus[$f] = $o }
+    }
+    # Reverse dependencies: every project that references a changed project, directly or through others.
+    $affected = New-Object 'Collections.Generic.HashSet[string]'; foreach ($d in $direct) { [void]$affected.Add($d) }
+    do { $grew = $false; foreach ($k in $proj.Keys) { if (-not $affected.Contains($k) -and @($proj[$k].refs | Where-Object { $affected.Contains($_) }).Count) { [void]$affected.Add($k); $grew = $true } } } while ($grew)
+    # Focused tests: test classes named after a changed type (FooTests, FooTest, Foo_Tests), and changed test files themselves.
+    $testFiles = @(Invoke-Quiet git -C $root -c core.quotepath=off ls-files --cached --others --exclude-standard -- '*.cs' '*.fs' '*.vb' | Where-Object { $tp = & $owner $_; $tp -and $proj[$tp].test })
+    $filters = @{}; $untested = New-Object Collections.Generic.List[string]
+    foreach ($f in @($focus.Keys | Sort-Object)) {
+        $stem = ($f -split '/')[-1] -replace '\.\w+$', ''
+        $hits = if ($proj[$focus[$f]].test) { @($f) } else { @($testFiles | Where-Object { (($_ -split '/')[-1] -replace '\.\w+$', '') -match "^$([regex]::Escape($stem))_?Tests?$" }) }
+        if (-not $hits.Count) { $untested.Add($f) }
+        foreach ($h in $hits) { $tp = & $owner $h; if (-not $filters.ContainsKey($tp)) { $filters[$tp] = New-Object Collections.Generic.List[string] }; $cls = ($h -split '/')[-1] -replace '\.\w+$', ''; if (-not $filters[$tp].Contains($cls)) { $filters[$tp].Add($cls) } }
+    }
+    $q = { param($x) '"' + ($x -replace '/', '\') + '"' }
+    [pscustomobject][ordered]@{
+        changed = $changed.Count; changedFiles = @($changed | Select-Object -First 50); projects = $proj.Count; testProjects = @($proj.Values | Where-Object { $_.test }).Count
+        buildWide = @($global); directProjects = @($direct | Sort-Object); affectedProjects = @($affected | Sort-Object); untestedChanges = @($untested)
+        build = @($direct | Sort-Object | ForEach-Object { "dotnet build $(& $q $_)" })
+        focused = @($filters.Keys | Sort-Object | ForEach-Object { "dotnet test $(& $q $_) --filter '$(@($filters[$_] | ForEach-Object { "FullyQualifiedName~$_" }) -join '|')'" })
+        regression = @($affected | Where-Object { $proj[$_].test } | Sort-Object | ForEach-Object { "dotnet test $(& $q $_)" })
+    }
+}
+function Get-ReviewFindings($r, $def, [string]$against) {
+    $root = $r.path
+    $changed = Get-ChangedLines $root $against
+    $rules = if ($def.review) { $def.review } else { [pscustomobject]@{ xmlDocs = 'convention'; maxLineLength = 0; broadCatch = '' } }
+    $all = @(Invoke-Quiet git -C $root -c core.quotepath=off ls-files --cached --others --exclude-standard | Where-Object { Test-Path -LiteralPath (Join-Path $root $_) })   # not files moved or deleted in the working tree
+    $testRx = '(?i)(^|/)[^/]*tests?[^/]*/|tests?\.cs$'
+    $genRx = '(?i)(^|/)(bin|obj|generated)/|\.(g|generated|designer)\.cs$'
+    $out = New-Object Collections.Generic.List[object]
+    $add = { param($rule, $sev, $file, $line, $msg, $scenario) $out.Add([pscustomobject][ordered]@{ rule = $rule; severity = $sev; file = $file; line = $line; scenario = $scenario; message = $msg }) }
+    $cs = @($changed.Keys | Where-Object { $_ -match '\.cs$' -and $_ -notmatch $genRx -and (Test-Path -LiteralPath (Join-Path $root $_)) } | Sort-Object)
+    $prod = @($cs | Where-Object { $_ -notmatch $testRx })
+    $lines = @{}; $set = @{}
+    foreach ($p in $cs) {
+        $lines[$p] = @([IO.File]::ReadAllLines((Join-Path $root $p)))
+        $h = New-Object 'Collections.Generic.HashSet[int]'; foreach ($n in $changed[$p]) { [void]$h.Add($n) }; $set[$p] = $h
+    }
+    $isNew = { param($p) $set[$p].Count -ge $lines[$p].Count }
+
+    # Scenarios 1-2: a function converts the validation exception although the exception middleware already does.
+    $mw = @(Invoke-Quiet git -C $root -c core.quotepath=off grep -l --untracked -F 'IFunctionsWorkerMiddleware' -- '*.cs' | Where-Object { [IO.File]::ReadAllText((Join-Path $root $_)) -match 'ValidationException' })
+    foreach ($p in $prod) {
+        $t = $lines[$p]
+        if (($t -join "`n") -notmatch '\[Function\(|HttpTrigger') { continue }
+        foreach ($n in @($changed[$p] | Sort-Object -Unique)) {
+            if ($n -gt $t.Count -or $t[$n - 1] -notmatch 'catch\s*\(\s*(?:[\w.]+\.)?(\w*ValidationException)\b') { continue }
+            $ex = $Matches[1]; $verb = ''
+            for ($i = $n - 1; $i -ge 1 -and $i -ge $n - 200; $i--) {
+                if ($t[$i - 1] -match 'HttpTrigger') { $verb = (@([regex]::Matches((($t[($i - 1)..([math]::Min($i + 2, $t.Count - 1))]) -join ' '), '(?i)"(get|post|put|patch|delete)"') | ForEach-Object { $_.Groups[1].Value.ToUpper() }) -join '/'); break }
+            }
+            if (-not $mw.Count) { continue }
+            $sc = if ($verb -match 'PUT') { 1 } elseif ($verb -match 'POST') { 2 } else { '' }
+            & $add 'redundant-validation-conversion' 'error' $p $n "$(if ($verb) { "$verb function" } else { 'Function' }) converts $ex itself, but $($mw[0]) already translates it into the HTTP response. Trace function -> dispatcher -> handler -> validation -> middleware, and remove this conversion only if the middleware response keeps the field, message, status, and contract." $sc
+        }
+    }
+
+    # Scenario 3: the same changed block twice (copied logic, or one review fix applied in two places).
+    $win = 4; $seen = @{}; $lastEnd = @{}
+    foreach ($p in $cs) {
+        $t = $lines[$p]
+        $sig = @($changed[$p] | Sort-Object -Unique | Where-Object { $_ -le $t.Count -and ($s = $t[$_ - 1].Trim()).Length -ge 8 -and $s -notmatch '^(using |//|/\*|\*|\[|#)|^[{}()\[\];,\s]*$' })
+        for ($i = 0; $i + $win -le $sig.Count; $i++) {
+            if ($sig[$i + $win - 1] - $sig[$i] -gt 2 * $win) { continue }
+            $key = (@($i..($i + $win - 1) | ForEach-Object { $t[$sig[$_] - 1].Trim() -replace '\s+', ' ' })) -join "`n"
+            if (-not $seen.ContainsKey($key)) { $seen[$key] = @{ p = $p; n = $sig[$i] }; continue }
+            $first = $seen[$key]
+            if ($first.p -eq $p -and $sig[$i] - $first.n -lt $win) { continue }
+            if ($lastEnd.ContainsKey($p) -and $sig[$i] -le $lastEnd[$p]) { $lastEnd[$p] = $sig[$i + $win - 1]; continue }
+            $lastEnd[$p] = $sig[$i + $win - 1]
+            & $add 'duplicate-change' 'error' $p $sig[$i] "The same changed block also appears at $($first.p):$($first.n); keep one implementation." 3
+        }
+    }
+
+    # Scenario 4: a validator that does not follow the sibling validators' FluentValidation pattern.
+    $validators = @($all | Where-Object { $_ -match 'Validator\.cs$' -and $_ -notmatch $testRx -and $_ -notmatch $genRx })
+    $near = { param($a, $b) $x = $a -split '/'; $y = $b -split '/'; $k = 0; while ($k -lt $x.Count -and $k -lt $y.Count -and $x[$k] -eq $y[$k]) { $k++ }; $k }
+    foreach ($p in @($prod | Where-Object { $_ -match 'Validator\.cs$' })) {
+        $sib = @($validators | Where-Object { $_ -ne $p } | Sort-Object { - (& $near $_ $p) } | Select-Object -First 40)
+        if (-not $sib.Count) { continue }
+        $st = @($sib | ForEach-Object { try { [IO.File]::ReadAllText((Join-Path $root $_)) } catch { '' } })
+        $me = $lines[$p] -join "`n"
+        $at = 1; for ($i = 0; $i -lt $lines[$p].Count; $i++) { if ($lines[$p][$i] -match '\bclass\s+\w+') { $at = $i + 1; break } }
+        $half = [math]::Ceiling($sib.Count / 2)
+        $abs = @($st | Where-Object { $_ -match 'AbstractValidator<' }).Count
+        $rf = @($st | Where-Object { $_ -match '\bRuleFor\s*\(' }).Count
+        $wm = @($st | Where-Object { $_ -match '\.WithMessage\s*\(' }).Count
+        $th = @($st | Where-Object { $_ -match 'throw\s+new\s+\w*Exception' }).Count
+        if ($abs -ge $half -and $me -notmatch 'AbstractValidator<') { & $add 'validator-pattern' 'error' $p $at "Does not derive from AbstractValidator<T>, as $abs of $($sib.Count) sibling validators do (closest: $($sib[0]))." 4 }
+        elseif ($rf -ge $half -and $me -notmatch '\bRuleFor\s*\(') { & $add 'validator-pattern' 'error' $p $at "Has no RuleFor rules; $rf of $($sib.Count) sibling validators declare their rules with RuleFor (closest: $($sib[0]))." 4 }
+        if (-not $th -and $me -match 'throw\s+new\s+\w*Exception') { & $add 'validator-pattern' 'error' $p $at 'Throws exceptions itself; no sibling validator does, they declare rules and let the validation pipeline report them.' 4 }
+        if ($wm -ge $half -and $me -match '\bRuleFor\s*\(' -and $me -notmatch '\.WithMessage\s*\(') { & $add 'validator-pattern' 'warning' $p $at "Sets no messages; $wm of $($sib.Count) sibling validators set them with WithMessage." 4 }
+    }
+
+    # Scenario 5: command and query dependencies in the wrong place.
+    $kindOf = { param($p) if ($p -match '(?i)(^|/)commands?/') { 'command' } elseif ($p -match '(?i)(^|/)quer(y|ies)/') { 'query' } else { '' } }
+    foreach ($p in $prod) {
+        $k = & $kindOf $p; if (-not $k) { continue }
+        $t = $lines[$p]; $new = & $isNew $p
+        for ($i = 0; $i -lt $t.Count; $i++) {
+            if ($t[$i] -notmatch '^\s*(?:(?:public|internal|sealed|abstract|static|partial|file)\s+)*(?:class|record|interface|struct|enum)\s+(\w+)') { continue }
+            $name = $Matches[1]
+            if (-not $new -and -not $set[$p].Contains($i + 1)) { continue }
+            if (($k -eq 'command' -and $name -match 'Query(Handler|Validator|Response|Result)?$') -or ($k -eq 'query' -and $name -match 'Command(Handler|Validator|Response|Result)?$')) {
+                & $add 'dependency-organization' 'error' $p ($i + 1) "$name is placed in a $k folder; put it with the other $(if ($k -eq 'command') { 'query' } else { 'command' }) types of this feature." 5; continue
+            }
+            if ($name -match '(Command|Query)(Handler|Validator|Response|Result|Dto)?$|Handler$|Validator$') { continue }
+            $other = if ($k -eq 'command') { 'query' } else { 'command' }
+            $cross = @(Invoke-Quiet git -C $root -c core.quotepath=off grep -l --untracked -w -F $name -- '*.cs' | Where-Object { $_ -ne $p -and $_ -notmatch $testRx -and (& $kindOf $_) -eq $other })
+            if ($cross.Count) { & $add 'dependency-organization' 'error' $p ($i + 1) "$name lives in a $k folder but $other code uses it ($($cross[0])); keep a dependency shared by commands and queries where sibling features keep shared dependencies." 5 }
+        }
+    }
+
+    # Scenario 6: missing or outdated XML documentation on changed public members.
+    $mode = "$($rules.xmlDocs)"
+    foreach ($p in $prod) {
+        $t = $lines[$p]; $h = $set[$p]; $text = $t -join "`n"
+        $iface = $text -match '\binterface\s+\w+'
+        $conv = $null
+        for ($i = 0; $i -lt $t.Count; $i++) {
+            $l = $t[$i]; $kind = ''; $name = ''; $ret = ''
+            if ($l -match '^\s*public\s+(?:(?:static|sealed|abstract|partial|readonly|ref|unsafe)\s+)*(?:class|record|interface|struct|enum)\s+(\w+)') { $kind = 'type'; $name = $Matches[1] }
+            elseif ($l -match '^\s*public\s+(?:(?:static|virtual|override|abstract|async|sealed|new|extern|unsafe|partial|readonly)\s+)*(?:(?<ret>[\w.?\[\],]+(?:<[^()]*>)?\??)\s+)?(?<name>\w+)\s*(?:<[^()]*>)?\s*\(') { $kind = 'method'; $name = $Matches['name']; $ret = "$($Matches['ret'])" }
+            elseif ($l -match '^\s*public\s+(?:(?:static|virtual|override|abstract|new|required)\s+)*[\w.?\[\],]+(?:<[^()]*>)?\??\s+(\w+)\s*(\{|=>|$)') { $kind = 'property'; $name = $Matches[1] }
+            elseif ($iface -and $l -match '^\s+(?<ret>[\w.?\[\],]+(?:<[^()]*>)?\??)\s+(?<name>\w+)\s*(?:<[^()]*>)?\s*\(' -and $l -notmatch '^\s*(return|await|new|if|for|foreach|while|switch|using|var|throw|public|private|protected|internal)\b') { $kind = 'method'; $name = $Matches['name']; $ret = "$($Matches['ret'])" }
+            if (-not $kind) { continue }
+            $end = $i
+            if ($kind -eq 'method') { $sigText = $l; while (($sigText.Split('(').Count -gt $sigText.Split(')').Count) -and $end -lt [math]::Min($t.Count - 1, $i + 15)) { $end++; $sigText += ' ' + $t[$end].Trim() } }
+            $j = $i - 1; while ($j -ge 0 -and $t[$j] -match '^\s*\[') { $j-- }
+            $docTop = $j; while ($docTop -ge 0 -and $t[$docTop] -match '^\s*///') { $docTop-- }
+            $doc = if ($j -gt $docTop) { ($t[($docTop + 1)..$j]) -join "`n" } else { '' }
+            $touched = $false; for ($x = $docTop + 2; $x -le $end + 1; $x++) { if ($h.Contains($x)) { $touched = $true; break } }
+            if (-not $touched) { continue }
+            if ($doc -match '<inheritdoc') { continue }
+            if ($doc -notmatch '<summary>') {
+                if ($null -eq $conv) {
+                    $dir = $p -replace '/?[^/]+$', ''
+                    $conv = ($mode -eq 'required') -or ($text -match '///\s*<summary>') -or [bool](@($all | Where-Object { ($_ -replace '/?[^/]+$', '') -eq $dir -and $_ -ne $p -and $_ -match '\.cs$' } | Select-Object -First 10 | Where-Object { [IO.File]::ReadAllText((Join-Path $root $_)) -match '///\s*<summary>' }).Count)
+                }
+                & $add 'xml-doc-missing' $(if ($conv) { 'error' } else { 'warning' }) $p ($i + 1) "Public $kind $name has no XML documentation$(if ($mode -eq 'required') { ' (required by this profile)' } elseif ($conv) { ' (the surrounding code documents its public members)' })." 6
+                continue
+            }
+            if ($kind -ne 'method') { continue }
+            $params = @(Get-ParamNames $sigText)
+            $documented = @([regex]::Matches($doc, '<param\s+name="(\w+)"') | ForEach-Object { $_.Groups[1].Value })
+            $gone = @($documented | Where-Object { $params -notcontains $_ })
+            $undoc = @($params | Where-Object { $documented -notcontains $_ })
+            if ($gone.Count -or $undoc.Count) {   # one finding per signature: stale names and undocumented parameters together
+                $what = @(if ($gone.Count) { "names parameter(s) $($gone -join ', ') that the signature does not have" }; if ($undoc.Count) { "has no <param> for $($undoc -join ', ')" }) -join ' and '
+                $stale = $gone.Count -or $documented.Count
+                & $add $(if ($stale) { 'xml-doc-outdated' } else { 'xml-doc-incomplete' }) $(if ($stale -or $mode -eq 'required') { 'error' } else { 'warning' }) $p ($i + 1) "XML documentation of $name $what; update it with the signature." 6
+            }
+            if ($mode -eq 'required' -and $ret -and $ret -notmatch '^(void|Task|ValueTask)$' -and $doc -notmatch '<returns>') { & $add 'xml-doc-incomplete' 'error' $p ($i + 1) "XML documentation of $name has no <returns>." 6 }
+        }
+    }
+
+    # A newly added collaborator, helper, wrapper, or similar type (or its interface) that at most one other production file uses.
+    foreach ($p in @($prod | Where-Object { & $isNew $_ })) {
+        $t = $lines[$p]
+        for ($i = 0; $i -lt $t.Count; $i++) {
+            if ($t[$i] -notmatch '^\s*(?:(?:public|internal|sealed|static|partial)\s+)*(?:class|interface|record)\s+(\w+(?:Collaborator|Helper|Wrapper|Manager|Provider|Factory|Container|Dependencies|Utility|Utils))\b') { continue }
+            $name = $Matches[1]
+            $users = @(Invoke-Quiet git -C $root -c core.quotepath=off grep -l --untracked -w -F $name -- '*.cs' | Where-Object { $_ -ne $p -and $_ -notmatch $testRx -and $_ -notmatch $genRx })
+            if ($users.Count -le 1) { & $add 'single-use-abstraction' 'warning' $p ($i + 1) "New type $name is used by $(if ($users.Count) { "only $($users[0])" } else { 'no other production file' }). Reuse an existing equivalent or keep the logic with its one consumer, unless sibling features use the same kind of type." '' }
+        }
+    }
+
+    # Profile rules and hygiene on changed lines of production code.
+    $mx = [int]$rules.maxLineLength
+    foreach ($p in $prod) {
+        $t = $lines[$p]
+        foreach ($n in @($changed[$p] | Sort-Object -Unique)) {
+            if ($n -gt $t.Count) { continue }
+            $l = $t[$n - 1]
+            if ($mx -gt 0 -and $l.Length -gt $mx) { & $add 'line-length' 'error' $p $n "Line has $($l.Length) characters; this profile allows $mx." '' }
+            if ($l -match 'throw\s+new\s+NotImplementedException|\b(TODO|FIXME)\b|\bPLACEHOLDER\b|<Your\w*>|\{\{\s*\w+\s*\}\}') { & $add 'placeholder' 'error' $p $n 'Placeholder or unfinished code in a change that is about to be reviewed.' '' }
+            if ($rules.broadCatch -and $l -match 'catch\s*\(\s*(System\.)?Exception\b|^\s*catch\s*(\{|$)') { & $add 'broad-catch' "$($rules.broadCatch)" $p $n 'Catches every exception; catch only what this code handles, as sibling code at this layer does.' '' }
+        }
+    }
+    foreach ($c in @(Invoke-Quiet git -C $root -c core.quotepath=off diff --check $against)) {
+        if ($c -match '^(.+?):(\d+):\s*(.+)$') { & $add 'diff-check' 'error' $Matches[1] ([int]$Matches[2]) "git diff --check: $($Matches[3])" '' }
+    }
+    [pscustomobject]@{ files = $changed.Count; reviewed = $cs.Count; findings = $out.ToArray() }
+}
+
 # pick: choose a requirement document (file dialog unless -Source), convert it, and drop it in the inbox as
 # <inbox>\<name>\refined-pbi.md with the original under source\. The selected file itself is never changed.
 function Out-PickFailed([string]$why) {
@@ -1399,8 +1749,12 @@ if ($Command -eq 'guard') {
     if (-not $cmdText) { throw 'guard needs -Line "<command line>" (use single quotes inside the command, not double quotes).' }
     $Line = $cmdText
     $g = Test-CommandLine $Line
+    if ($Repo -and $g.decision -eq 'ALLOW' -and $Line -match '(?i)\bdotnet(\.exe)?\s+(build|test|restore|run|msbuild|pack|publish|clean)\b') {
+        $gr = Resolve-Repo $Repo; $null = Assert-Preflight $gr
+        $sol = Test-SolutionUse $gr $Line; if ($sol) { $g = $sol }
+    }
     if ($g.decision -eq 'NEEDS_APPROVAL' -and $ApprovedBy) { $g.decision = 'APPROVED'; $g.reason += "; approved by $ApprovedBy" }
-    if ($g.decision -eq 'BLOCK' -and $ApprovedBy) { $g.reason += '; an approval cannot release a blocked command (it needs a policy change through the authorized process)' }
+    if ($g.decision -eq 'BLOCK' -and $ApprovedBy -and $g.category -ne 'wrong-solution') { $g.reason += '; an approval cannot release a blocked command (it needs a policy change through the authorized process)' }
     if ($Id) {
         $td = Find-TaskDir $Id $Repo
         $log = Join-Path $td 'evidence\commands.tsv'
@@ -1693,7 +2047,24 @@ if ($Command -eq 'context') {
     foreach ($p in $roles.Keys) { if ($roles[$p] -eq 'test') { $k = & $subjectOf $p; if (-not $testsBySubject.ContainsKey($k)) { $testsBySubject[$k] = New-Object Collections.Generic.List[string] }; $testsBySubject[$k].Add($p) } }
     $core = 'endpoint', 'command', 'query', 'handler', 'validator', 'service', 'repository', 'model', 'mapping', 'ui', 'ui-service', 'graphql', 'contract', 'schema'
     $scored = New-Object Collections.Generic.List[object]
-    foreach ($p in @(@($syms.Keys) + @($roles.Keys) | Select-Object -Unique)) {
+    $allPaths = @(@($syms.Keys) + @($roles.Keys) | Select-Object -Unique)
+    # Exact symbol or file name first: one identifier that names a type, member, or file is answered without ranking.
+    $exact = $null
+    if ($Query.Trim() -match '^[A-Za-z_][\w.]*$' -and $Query.Trim() -cmatch '[a-z0-9][A-Z]|\.[A-Za-z]|_') {   # code-shaped (CreateOrderValidator, order.service.ts, get_order); a plain word is free text
+        $q = $Query.Trim(); $qBase = $q -replace '\.[A-Za-z0-9]+$', ''
+        $exact = @(foreach ($p in $allPaths) {
+                $leaf = $p.Substring($p.LastIndexOf('/') + 1)
+                $hit = ($leaf -ieq $q) -or (($leaf -replace '\.[A-Za-z0-9]+$', '') -ieq $qBase)
+                if (-not $hit -and $syms.ContainsKey($p)) { foreach ($sy in $syms[$p]) { if ($sy.kind -ne 'import' -and $sy.name -ieq $q) { $hit = $true; break } } }
+                if ($hit) { [pscustomobject]@{ path = $p; role = $roles[$p]; score = 100.0; matched = @($terms); refs = $null } }
+            })
+    }
+    # A file none of whose path or symbol text contains a term (stem, minus a trailing y for 'ies' stems) cannot match: skip tokenizing it.
+    $needles = @($terms | ForEach-Object { $_.TrimEnd('y') } | Where-Object { $_ })
+    foreach ($p in $(if ($exact) { @() } else { $allPaths })) {
+        $hay = $p.ToLowerInvariant(); if ($syms.ContainsKey($p)) { foreach ($sy in $syms[$p]) { $hay += "|" + $sy.lname } }
+        $any = $false; foreach ($t in $needles) { if ($hay.Contains($t)) { $any = $true; break } }
+        if (-not $any) { continue }
         $slash = $p.LastIndexOf('/')
         $fileTok = @(Get-Tokens $p.Substring($slash + 1)); $dirTok = if ($slash -gt 0) { @(Get-Tokens $p.Substring(0, $slash)) } else { @() }
         $s = 0.0; $matched = New-Object Collections.Generic.List[string]
@@ -1712,18 +2083,29 @@ if ($Command -eq 'context') {
         if ($role -eq 'test') { $s *= 0.6 }
         $scored.Add([pscustomobject]@{ path = $p; role = $role; score = $s; matched = @($matched); refs = $null })
     }
-    # References: how many other files name the file's main type (git grep, only for the top candidates).
+    if ($exact) { foreach ($c in $exact) { $scored.Add($c) } }
+    # References: how many other files name the file's main type (one git grep for all top candidates).
     $top = @($scored | Sort-Object @{ e = { $_.score }; Descending = $true }, path | Select-Object -First $refChecks)
+    $mainOf = @{}
     foreach ($c in $top) {
         if ($c.role -eq 'test') { continue }
         $main = @($syms[$c.path] | Where-Object { $_.kind -eq 'type' } | Select-Object -First 1).name
         if (-not $main) { $leaf = $c.path.Substring($c.path.LastIndexOf('/') + 1); $main = $leaf.Split('.')[0] }
-        if ($main.Length -lt 4) { continue }
-        $n = @(Invoke-Quiet git -C $r.path grep -l -w -F -e $main -- . ":(exclude)$($c.path)").Count
-        $c.refs = $n; $c.score += [math]::Min($n, 10) * 0.4
+        if ($main.Length -ge 4) { $mainOf[$c.path] = $main }
+    }
+    $usedIn = @{}   # name -> files that contain it as a word
+    if ($mainOf.Count) {
+        $gargs = @('-C', $r.path, '-c', 'core.quotepath=off', 'grep', '-o', '-w', '-F'); foreach ($name in @($mainOf.Values | Select-Object -Unique)) { $gargs += '-e', $name }
+        foreach ($l in @(Invoke-Quiet git @gargs -- .)) { $i = $l.LastIndexOf(':'); if ($i -gt 0) { $k = $l.Substring($i + 1); if (-not $usedIn.ContainsKey($k)) { $usedIn[$k] = New-Object 'Collections.Generic.HashSet[string]' }; [void]$usedIn[$k].Add($l.Substring(0, $i)) } }
+    }
+    foreach ($c in $top) {
+        if (-not $mainOf.ContainsKey($c.path)) { continue }
+        $files = if ($usedIn.ContainsKey($mainOf[$c.path])) { @($usedIn[$mainOf[$c.path]] | Where-Object { $_ -ne $c.path }) } else { @() }
+        $c.refs = $files.Count; $c.score += [math]::Min($files.Count, 10) * 0.4
+        if ($exact) { $c | Add-Member -NotePropertyName callers -NotePropertyValue @($files | Sort-Object | Select-Object -First 10) }
     }
     $ranked = @($scored | Sort-Object @{ e = { $_.score }; Descending = $true }, path)
-    $out = [ordered]@{ repo = $r.id; mode = $m; budgetChars = $budget; terms = $terms; memory = $sync.memory; facts = @(); files = @(); more = @(); usedChars = 0
+    $out = [ordered]@{ repo = $r.id; mode = $m; budgetChars = $budget; terms = $terms; exact = [bool]$exact; memory = $sync.memory; facts = @(); files = @(); more = @(); usedChars = 0
         note = 'Ranked by deterministic matching, not proof: read the cited lines before classifying a requirement; use -Mode deep or targeted search when nothing fits.' }
     $used = 0
     foreach ($f in @($facts.all | Where-Object { $_.status -ne 'invalid' })) {   # facts first: they carry verified knowledge
@@ -1754,6 +2136,7 @@ if ($Command -eq 'context') {
             refs = $c.refs
             siblings = $sib
         }
+        if ($c.PSObject.Properties['callers']) { $row | Add-Member -NotePropertyName callers -NotePropertyValue $c.callers }
         $len = ($row | ConvertTo-Json -Compress).Length
         if ($used + $len -gt $budget -and $out.files.Count) { $out.more += $c.path; if ($out.more.Count -ge 20) { break }; continue }
         $out.files += $row; $used += $len
@@ -1973,6 +2356,50 @@ if ($Command -eq 'snapshot') {
     [pscustomobject][ordered]@{ status = 'SNAPSHOT_SAVED'; id = $Id; folder = $snap; files = $copied; statuses = $sum } | ConvertTo-Json -Depth 4
     exit 0
 }
+# profile: which repository development profile applies (DAB, CDMS, or none), with the evidence and the files to load.
+if ($Command -eq 'profile') {
+    $r = Resolve-Repo $Repo; $null = Assert-Preflight $r
+    Get-RepoProfile $r $Key $Query | ConvertTo-Json -Depth 5
+    exit 0
+}
+
+# affected: staged test selection for the current change (read-only). A: build, B: focused tests, C: affected regression, D: full suite once.
+if ($Command -eq 'affected') {
+    $r = Resolve-Repo $Repo; $null = Assert-Preflight $r
+    $against, $scope = Get-ChangeBase $r $Base
+    $a = Get-AffectedTests $r $against
+    $prof = Get-RepoProfile $r $Key
+    $full = if ($prof.commands) { $prof.commands.test } else { "the repository's full test command (section 2, Commands)" }
+    $wide = [bool]$a.buildWide.Count
+    $status = if (-not $a.changed) { 'NO_CHANGES' } elseif (-not $a.projects) { 'NO_PROJECTS' } elseif ($wide) { 'BUILD_WIDE' } else { 'SELECTED' }
+    [pscustomobject][ordered]@{ status = $status; repo = $r.id; scope = $scope; profile = $(if ($prof.profile) { $prof.profile } else { "none ($($prof.status))" })
+        changed = $a.changed; changedFiles = $a.changedFiles; projects = $a.projects; testProjects = $a.testProjects; buildWide = $a.buildWide
+        directProjects = $a.directProjects; affectedProjects = $a.affectedProjects; untestedChanges = $a.untestedChanges
+        stages = [ordered]@{
+            A_build = @(if ($wide -or -not $a.projects) { @(if ($prof.commands) { $prof.commands.build } else { "the repository's build command" }) } else { $a.build })
+            B_focused = @($a.focused)
+            C_regression = @(if ($wide -or -not $a.projects) { $full } else { $a.regression })
+            D_full = [ordered]@{ command = $full; workingDirectory = $(if ($prof.commands) { $prof.commands.workingDirectory } else { $r.path }); when = 'once, at the final quality gate; never skipped (if it cannot run, report it as not run with the reason)' } }
+        next = $(if ($wide) { "Build-wide files changed ($($a.buildWide -join ', ')): build the solution and run the full suite; the change cannot be narrowed to projects." } elseif ($a.changed) { 'Run A after each edit, B for the changed code, C before handover, D once at the final gate. Check each command with guard -Repo first. untestedChanges have no test named after them: find or add one (S8).' } else { 'Nothing changed against the base.' }) } | ConvertTo-Json -Depth 5
+    exit 0
+}
+
+# review: pre-PR review of the change (recorded PR regression scenarios, profile rules, git diff --check). Read-only.
+if ($Command -eq 'review') {
+    $r = Resolve-Repo $Repo; $null = Assert-Preflight $r
+    $against, $scope = Get-ChangeBase $r $Base
+    $prof = Get-RepoProfile $r $Key
+    $def = if ($prof.profile) { @((Read-Profiles).profiles) | Where-Object { $_.id -eq $prof.profile } | Select-Object -First 1 } else { $null }
+    $res = Get-ReviewFindings $r $def $against
+    $err = @($res.findings | Where-Object { $_.severity -eq 'error' }).Count; $warn = @($res.findings | Where-Object { $_.severity -eq 'warning' }).Count
+    [pscustomobject][ordered]@{ status = $(if ($err) { 'FINDINGS' } elseif ($warn) { 'WARNINGS' } else { 'PASSED' }); repo = $r.id
+        profile = $(if ($prof.profile) { $prof.profile } else { "none ($($prof.status))" }); scope = $scope; changedFiles = $res.files; csharpFilesReviewed = $res.reviewed; errors = $err; warnings = $warn
+        findings = @($res.findings)
+        scenarios = @('1 PUT function converts the validation exception the middleware handles', '2 POST function converts it', '3 duplicate changes', '4 validator not following sibling FluentValidation pattern', '5 command/query dependencies misplaced', '6 missing or outdated XML documentation')
+        notChecked = @('build, tests, and analyzers (run them)', 'SonarCloud (sonar -Check gate/issues, or "not verified")', 'business behavior and API consumers (read them)', 'review comment threads, including duplicate comments (read the PR)') } | ConvertTo-Json -Depth 4
+    exit 0
+}
+
 switch ($Command) {
     'inbox' {
         New-Item -ItemType Directory -Force -Path $InboxDir | Out-Null
