@@ -23,10 +23,12 @@ Spec: ./spec.md · Task folder: <path> · Evidence: <task folder>/evidence/
 
 ## 2. Tasks
 Order matters. Every file listed was found in the repo (no invented paths); new files name the existing pattern they copy.
+Task: a descriptive title taken from the work itself (e.g. "Implement reference color lookup"); people see this title, the T id stays internal. Objective: what the task delivers and why the PBI needs it.
+Task status values: Not Started | In Progress | Implemented - Verification Pending | Blocked: <reason> | Verified | Completed (Completed only when its checks ran and passed).
 
-| T | Task | REQ | Repo | File | Action (reuse / modify / new) | Evidence (`path:line`, or sibling copied) | Depends on | ACs | Status |
-|---|------|-----|------|------|-------------------------------|--------------------------------------------|------------|-----|--------|
-| T1 | | REQ-1 | | | | | — | AC1 | todo |
+| T | Task | Objective (what and why) | REQ | Repo | File | Action (reuse / modify / new) | Evidence (`path:line`, or sibling copied) | Depends on | ACs | Status |
+|---|------|--------------------------|-----|------|------|-------------------------------|--------------------------------------------|------------|-----|--------|
+| T1 | | | REQ-1 | | | | | — | AC1 | Not Started |
 
 Reused without change (components used as they are; no edit planned):
 | Component `path` | REQ | Used by task |

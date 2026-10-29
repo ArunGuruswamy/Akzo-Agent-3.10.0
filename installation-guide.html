@@ -39,7 +39,7 @@ footer{max-width:960px;margin:0 auto;padding:0 16px 32px;color:var(--muted);font
 <body>
 <header><div>
   <h1>Akzo SDD agent for GitHub Copilot</h1>
-  <p style="font-weight:600;margin:0 0 6px">Akzo Master SDD Agent v3.9.0 (release candidate) — Developed and maintained by Arun RG</p>
+  <p style="font-weight:600;margin:0 0 6px">Akzo Master SDD Agent v3.10.0 (release candidate) — Developed and maintained by Arun RG</p>
   <p>Install, configure, and use the <code>akzo-master-sdd</code> custom agent in VS Code and Visual Studio 2026. Everything below matches the scripts in this repository.</p>
 </div></header>
 <nav aria-label="Sections">
@@ -288,7 +288,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\.akzo-agen
     <li>A Windows file dialog opens (look behind the IDE window if you do not see it). Choose the refined PBI: <code>.md</code>, <code>.txt</code>, or <code>.docx</code>; <code>.pdf</code> needs <code>pdftotext</code> (Poppler) on PATH. The file is converted to <code>%USERPROFILE%\.akzo-agent\inbox\&lt;file name&gt;\refined-pbi.md</code>; the original is kept under <code>source\</code> and never changed.</li>
     <li>A second dialog opens: select any number of <b>supporting documents</b> at once (Ctrl+click), or Cancel for none. They are copied to <code>supporting\</code> beside the PBI; your originals are never changed, duplicates are detected, and a second file with the same name is kept as <code>name-2</code>. Readable: Markdown, text, JSON, YAML, XML, CSV, code, <code>.docx</code>, <code>.xlsx</code>, <code>.pdf</code> (with <code>pdftotext</code>); images and other formats are listed but not read.</li>
     <li>The agent reads the PBI number and title from the document and picks the repository (the open workspace, or the only one registered). When all three are clear it starts at once; otherwise it asks one question batch with the answers pre-selected.</li>
-    <li>It copies everything to <code>&lt;tasks&gt;\&lt;repo-id&gt;\&lt;PBI number&gt;\</code>, uses the repository's architecture index, and maps every requirement to existing code (EXISTING / REUSABLE / EXTEND / NEW / UNKNOWN). It then <b>stops three times for your approval</b>: after the gap map, after <code>spec.md</code>, and after <code>plan.md</code> (in the repository's spec folder as <code>&lt;TitleInPascalCase&gt;\</code>, or beside the PBI). Reply <code>approve</code>, <code>approve all</code> (no further stops), or your changes. After plan approval it implements test first, builds, tests, runs analyzers/Sonar, fixes, and reports.</li>
+    <li>It copies everything to <code>&lt;tasks&gt;\&lt;repo-id&gt;\&lt;PBI number&gt;\</code>, uses the repository's architecture index, and maps every requirement to existing code (EXISTING / REUSABLE / EXTEND / NEW / UNKNOWN). It then <b>stops three times for your approval</b>: after the gap map, after <code>spec.md</code>, and after <code>plan.md</code> (in the repository's spec folder as <code>&lt;TitleInPascalCase&gt;\</code>, or beside the PBI). Each stop is shown by name with what you are deciding, and you choose <b>Approve</b>, <b>Request changes</b>, or <b>Custom response</b> (typing <code>approve</code> or <code>approve all</code> still works; see <a href="#gates">Gates and progress</a>). After plan approval it implements test first, builds, tests, runs analyzers/Sonar, fixes, and reports.</li>
   </ol>
   <p><b>Without the chat command:</b> double-click <b>Start-Development.cmd</b> (the same two dialogs), then type <code>start</code> in Copilot Chat (it is on the clipboard). You can also drop files or folders (PBI plus notes) in the inbox yourself and type <code>start</code>. Add documents to a running task with <code>attach &lt;files&gt; to &lt;PBI&gt;</code>; type <code>develop &lt;PBI&gt; end to end</code> to run without the approval stops.</p>
   <p class="muted"><b>Approval limits:</b> the gates are enforced by the agent's instructions and the statuses recorded in <code>spec.md</code> and <code>plan.md</code>. Copilot offers no hook that blocks file edits, so the IDE cannot technically stop a model error or an explicit instruction from skipping a gate.</p>
@@ -296,6 +296,25 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\.akzo-agen
 </section>
 
 <section id="task">
+  <h2 id="gates">Gates and progress (3.10.0)</h2>
+  <p>You never need to type a gate or task id. The agent names each stop and each task in words; the ids stay in files and logs.</p>
+  <div class="wrap"><table>
+    <thead><tr><th>Stop</th><th>What you decide</th><th>Internal id</th></tr></thead>
+    <tbody>
+      <tr><td>Requirement Clarification</td><td>Answers to the questions the PBI leaves open</td><td>G1</td></tr>
+      <tr><td>Existing Code Analysis &amp; Gap Assessment</td><td>Whether each requirement is mapped to the right existing code (EXISTING / REUSABLE / EXTEND / NEW / UNKNOWN)</td><td>G2</td></tr>
+      <tr><td>Technical Specification Review</td><td>Business rules, acceptance criteria, contract changes, open questions in <code>spec.md</code></td><td>G3</td></tr>
+      <tr><td>Implementation Plan Approval</td><td>The named tasks and the files each one changes in <code>plan.md</code>; no source file is edited before this</td><td>G4</td></tr>
+      <tr><td>Build, Test &amp; Quality Verification</td><td>The verification report: what passed, failed, or was not verified</td><td>G5</td></tr>
+      <tr><td>Corporate Security Check</td><td>Every FAIL and NOT VERIFIED control; never corporate approval</td><td>G8</td></tr>
+    </tbody>
+  </table></div>
+  <ul>
+    <li><b>Choices at a stop:</b> Approve (continue), Request changes (the stage is revised and shown again), Custom response (a question or another instruction; nothing is approved). Where the IDE offers clickable options (VS Code <code>askQuestions</code>) they appear as buttons; otherwise as numbered options. "ok", "thanks", or "continue" is never taken as approval.</li>
+    <li><b>Approval history:</b> each decision is appended to <code>&lt;tasks&gt;\&lt;repo&gt;\&lt;PBI&gt;\approvals.jsonl</code> with the stop's name, your choice and words (secrets redacted), your user name, the time, and the SHA-256 of the document you decided on. A stop cannot be approved twice, before the stop before it, or after you asked for changes until the revised version is shown.</li>
+    <li><b>Task progress</b> uses the task titles from <code>plan.md</code> and these statuses: Not Started, In Progress, Implemented - Verification Pending, Blocked, Verified (its build and tests ran and passed), Completed (the final checks passed). Plans written before 3.10.0 (<code>todo</code> / <code>done</code>) are read the same way. Stop names and explanations can be edited in <code>modules\plan\assets\workflow.json</code>.</li>
+  </ul>
+
   <h2>Start a task from a refined PBI (manual)</h2>
   <p>Put each refined PBI in its own folder under the tasks folder. The folder names tell the agent the target repository and the PBI ID:</p>
   <div class="cmd"><pre>&lt;tasks folder&gt;\&lt;repo-id&gt;\&lt;PBI-ID&gt;\refined-pbi.md</pre></div>

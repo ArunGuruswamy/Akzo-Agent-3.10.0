@@ -443,7 +443,7 @@ try {
     Check ($t0.status -eq 'BRANCH_DECISION_NEEDED' -and -not (Test-Path "$fixture\specs") -and @($t0.branch.options).Count -eq 3 -and $t0.branch.uncommitted -ge 1 -and $t0.branch.branch) 'branch decision: before spec and plan go into the repository, the branch, HEAD, and uncommitted changes are shown and nothing is created'
     $null = PS51 $helper branchuse -Repo backend -Id PBI-15 -Confirmed
     $t = Task -Id PBI-15 -RepoMode
-    Check ($t.status -eq 'READY' -and $t.mode -eq 'repo' -and (Test-Path "$fixture\specs\PBI-15\spec.md") -and -not (Test-Path "$fixture\specs\PBI-15\refined-pbi.md")) 'repo mode puts spec/plan in the repo; PBI stays in the task folder; REFINED-PBI.md accepted'
+    Check ($t.status -eq 'READY' -and $t.mode -eq 'repo' -and (Test-Path "$fixture\specs\PBI-15\spec.md") -and -not (Test-Path "$fixture\specs\PBI-15\refined-pbi.md")) 'repo mode puts spec/plan in the repo; PBI stays in the task folder; REFINED-PBI.md accepted' "$($t.status) $($t.mode) $("$($t.text)".Substring(0, [math]::Min(600, "$($t.text)".Length)))"
     Check (((& git -C $fixture status --porcelain) -join "`n") -match 'specs/') 'repo-mode artifacts are visible in git status'
     Remove-Item "$fixture\specs" -Recurse -Force
 
@@ -1056,6 +1056,50 @@ try {
     Copy-Item "$Source\copilot\modules\plan\assets\plan.md" "$pr\specs\OldFeature\plan.md"
     $old = Task -Id 290000
     Check ($old.status -eq 'READY' -and $old.taskKind -eq 'existing' -and $old.specStatus -like 'Approved*' -and $old.branchState.relation -match 'no branch decision recorded') 'upgrade: a task created before 3.5.0 resumes with its spec and approvals; the missing branch decision is reported, not forced'
+
+    # ---- 3.10.0: gate and task names people can read, recorded gate decisions, Git state, generated clients.
+    $wf = Get-Content "$Source\copilot\modules\plan\assets\workflow.json" -Raw | ConvertFrom-Json
+    Check ((@($wf.gates | ForEach-Object { $_.id }) -join ',') -eq 'G1,G2,G3,G4,G5,G8' -and @($wf.gates | Where-Object { -not $_.title -or -not $_.purpose -or -not $_.deliverable -or -not $_.review -or -not $_.afterApproval }).Count -eq 0 -and (@($wf.gates | Where-Object { $_.document } | ForEach-Object { "$($_.id)=$($_.document)/$($_.key)" }) -join ',') -eq 'G2=spec.md/Gap map,G3=spec.md/Status,G4=plan.md/Status') 'workflow: the agent''s real gates (no invented G6/G7), each with a title, purpose, deliverable, review, and next step; G2-G4 point at the status lines they set'
+    Check ($old.gates -match 'G2 Existing Code Analysis & Gap Assessment; G3 Technical Specification Review; G4 Implementation Plan Approval' -and $old.specStatus -like 'Approved*' -and -not $old.planTasks -and -not $old.approvals -and $null -eq $old.nextGate) 'upgrade: a pre-3.10.0 task shows gate titles with its existing statuses; an unfilled plan template yields no tasks and no pending gate'
+    $wd = "$tmp\wf302000"; New-Item -ItemType Directory -Force "$tasks\paint\302000", $wd | Out-Null
+    Set-Content "$tasks\paint\302000\refined-pbi.md" "# 302000 Reference color lookup`nAC1: the reference color is resolved." -Encoding UTF8
+    [pscustomobject]@{ repo = 'paint'; id = '302000'; title = 'Reference color lookup'; specDir = $wd } | ConvertTo-Json | Set-Content "$tasks\paint\302000\task.json"
+    (Get-Content "$Source\copilot\modules\spec\assets\spec.md") -replace '^Status: .*', 'Status: Draft' -replace '^Gap map: .*', 'Gap map: Draft' | Set-Content "$wd\spec.md"
+    (Get-Content "$Source\copilot\modules\plan\assets\plan.md") -replace '^Status: .*', 'Status: Draft' -replace '^\| T1 \|.*', "| T1 | Implement reference color lookup | resolves the color | REQ-1 | paint | a.cs | new | b.cs | — | AC1 | done |`n| T2 | Implement request naming | names requests | REQ-2 | paint | c.cs | modify | c.cs:4 | T1 | AC2 | Blocked: generated GraphQL client missing |`n| T3 | | | REQ-3 | paint | d.cs | modify | d.cs:1 | T2 | AC3 | todo |`n| T4 | Verify build and coverage | evidence | REQ-1 | paint | - | reuse | - | T3 | AC1 | Implemented - verification pending |" | Set-Content "$wd\plan.md"
+    $w1 = Task -Id 302000
+    $pt = @($w1.planTasks)
+    Check ($w1.nextGate.id -eq 'G2' -and $w1.nextGate.title -eq 'Existing Code Analysis & Gap Assessment' -and $w1.nextGate.afterApproval -and (@($w1.nextGate.choices) -join '|') -eq 'Approve|Request changes|Custom response') 'gate awaiting a decision: shown by its title with what to review, what follows, and the three choices'
+    Check ($pt.Count -eq 4 -and $pt[0].title -eq 'Implement reference color lookup' -and $pt[0].status -eq 'Completed' -and $pt[1].status -eq 'Blocked' -and $pt[1].detail -match 'GraphQL client missing' -and $pt[2].status -eq 'Not Started' -and $pt[2].title -match 'no title' -and $pt[3].status -eq 'Implemented - Verification Pending') 'plan tasks: descriptive titles from plan.md, old todo/done statuses mapped, blockers kept, an untitled task flagged, implementation kept apart from verification' ("$($pt | ConvertTo-Json -Compress)")
+    $d0 = PS51 $helper decide -Id 302000 -Gate G2 -Decision changes
+    $d1 = J (PS51 $helper decide -Id 302000 -Gate G3 -Decision approve)
+    Check ($d0.code -ne 0 -and $d0.out -match 'needs -Text' -and $d1.status -eq 'OUT_OF_ORDER' -and (Get-Content "$wd\spec.md" -Raw) -match '(?m)^Status: Draft' -and -not (Test-Path "$tasks\paint\302000\approvals.jsonl")) 'decide: a change request needs the developer''s words, and a later gate cannot be approved while an earlier one is open; nothing is recorded'
+    $d2 = J (PS51 $helper decide -Id 302000 -Gate G2 -Decision changes -Text 'Also check the CDMS lookup; token=abc123secretvalue')
+    $d3 = J (PS51 $helper decide -Id 302000 -Gate G2 -Decision approve)
+    Check ($d2.status -eq 'RECORDED' -and (Get-Content "$wd\spec.md" -Raw) -match '(?m)^Gap map: Changes requested \(by ' -and $d3.status -eq 'NEEDS_REVISION') 'request changes: the gate is reopened and cannot be approved until the revised deliverable is presented again'
+    (Get-Content "$wd\spec.md") -replace '^Gap map: .*', 'Gap map: Draft' | Set-Content "$wd\spec.md"
+    $d4 = J (PS51 $helper decide -Id 302000 -Gate G2 -Decision approve)
+    $d5 = J (PS51 $helper decide -Id 302000 -Gate G2 -Decision approve)
+    $d6 = J (PS51 $helper decide -Id 302000 -Gate G3 -Decision custom -Text 'Explain AC1 before I decide')
+    $log = @(Get-Content "$tasks\paint\302000\approvals.jsonl" | ForEach-Object { $_ | ConvertFrom-Json })
+    Check ($d4.status -eq 'RECORDED' -and $d4.newStatus -like 'Approved (by *' -and $d4.next -match 'Technical Specification Review' -and $d5.status -eq 'ALREADY_APPROVED' -and $d6.status -eq 'RECORDED' -and (Get-Content "$wd\spec.md" -Raw) -match '(?m)^Gap map: Approved \(by ' -and (Get-Content "$wd\spec.md" -Raw) -match '(?m)^Status: Draft') 'decide: approval sets the status line once (a repeat is refused), and a custom response approves nothing'
+    Check ($log.Count -eq 3 -and (@($log | ForEach-Object { $_.decision }) -join ',') -eq 'changes,approve,custom' -and $log[1].title -eq 'Existing Code Analysis & Gap Assessment' -and $log[1].sha256 -match '^[0-9a-f]{64}$' -and $log[1].by -and $log[1].at -and $log[0].feedback -notmatch 'abc123secretvalue') 'approval history: each decision with gate title, user, time, and the hash of the document decided on; secrets in feedback are redacted' ("$(Get-Content "$tasks\paint\302000\approvals.jsonl" -Raw)")
+    $w2 = Task -Id 302000
+    Check ($w2.nextGate.id -eq 'G3' -and @($w2.approvals).Count -eq 3 -and @($w2.planTasks)[0].status -eq 'Completed') 'resume after decisions: the next open gate, the recorded decisions, and the task statuses are read back'
+    $gq = New-Fixture 'gql' @{ 'Gql.sln' = ''; 'src/Lookup.cs' = "public class Lookup`n{`n    public int Value() => 1;`n}`n" }
+    & git -C $gq branch -M main
+    $repoList += [pscustomobject]@{ id = 'gql'; path = $gq; purpose = 'fixture 3.10.0'; commands = @{}; verified = @{ date = '' } }
+    Write-Registry ''
+    & git -C $gq checkout -qb other; Set-Content "$gq\src\Lookup.cs" "public class Lookup`n{`n    public int Value() => 2;`n}" -NoNewline; & git -C $gq commit -qam other
+    & git -C $gq checkout -q main; Set-Content "$gq\src\Lookup.cs" "public class Lookup`n{`n    public int Value() => 3;`n}" -NoNewline; & git -C $gq commit -qam main
+    $ErrorActionPreference = 'Continue'; & git -C $gq merge -q other 2>&1 | Out-Null; $ErrorActionPreference = 'Stop'
+    New-Item -ItemType Directory -Force "$gq\src\Generated" | Out-Null; [IO.File]::WriteAllText("$gq\src\Generated\FormulaClient.Generated.cs", '')
+    Set-Content "$gq\notes.txt" 'staged note'; & git -C $gq add notes.txt
+    $gb = J (PS51 $helper branchinfo -Repo gql)
+    Check ($gb.operationInProgress -eq 'merge' -and @($gb.conflicted) -contains 'src/Lookup.cs' -and $gb.staged -ge 1 -and $gb.untracked -ge 1) 'git state: a merge in progress, conflicted files, staged and untracked changes are reported before any edit' ("$($gb | ConvertTo-Json -Compress)")
+    $gr = J (PS51 $helper review -Repo gql)
+    Check (@($gr.findings | Where-Object { $_.rule -eq 'generated-empty' -and $_.file -eq 'src/Generated/FormulaClient.Generated.cs' }).Count -eq 1 -and @($gr.findings | Where-Object { $_.rule -eq 'diff-check' -and $_.message -match 'conflict marker' }).Count -ge 1 -and $gr.status -eq 'FINDINGS') 'review: an empty generated client and leftover conflict markers are errors' ("$($gr.findings | ConvertTo-Json -Compress)")
+    Check ($agent -match '`decide -Id <PBI> -Gate G2\|G3\|G4' -and $agent -match '1\. Approve - ' -and $agent -match '2\. Request changes - ' -and $agent -match '3\. Custom response - ' -and $agent -match 'Never require the developer to type a gate id, a task id, or a command' -and $agent -match 'is not approval: answer it, then ask the same choice again' -and $agent -match 'plan/assets/workflow\.json') 'agent: gates are presented by title with Approve / Request changes / Custom response, recorded with decide, and ambiguous replies are never approval'
+    Check ($agent -match 'never by its T id alone' -and $agent -match 'Implemented - Verification Pending' -and $agent -match 'never restarts a Verified or Completed task' -and $agent -match 'operationInProgress' -and $agent -match 'generated-empty' -and $agent -match 'DONE = Ready for Pull Request' -and $agent -notmatch 'mark the task `done`') 'agent: tasks named by title, implementation kept apart from verification, no restart after completion, merge state and generated clients checked'
     Check ($agent -match '"New Development"' -and $agent -match '"Start Implementation"' -and $agent -match 'Never resume or reuse the previous PBI' -and $agent -match 'never take the newest inbox item' -and $agent -match 'a\) start new development and browse for a PBI' -and $agent -match 'b\) modify an existing implementation' -and $agent -match 'c\) resume an existing PBI' -and $agent -match 'Never skip intake') 'agent: fresh-task entry phrases, the a/b/c choice for ambiguous requests, and no skipped intake'
     Check ($agent -match '## 0a\. Repository and branch' -and $agent -match 'a\) create a new feature branch' -and $agent -match 'b\) continue on the current branch' -and $agent -match 'c\) select an existing branch' -and $agent -match 'never assumptions' -and $agent -match 'Never stash, reset' -and $agent -match 'nothing moves from reading the PBI straight to implementation' -and $agent -match '\*\*Modify\*\*' -and $agent -match 'Architecture memory vs PBI progress' -and $agent -match 'A stage with build errors is never marked done') 'agent: branch step, the fixed 11-step order, Modify mode, memory separation, and stage validation'
     # ---- 3.6.0: repository profiles (DAB / CDMS isolation), source grounding, pre-PR review regression scenarios.

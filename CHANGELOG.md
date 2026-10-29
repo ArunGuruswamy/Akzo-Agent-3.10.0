@@ -2,6 +2,28 @@
 
 Akzo SDD Agent — Developed and maintained by Arun RG. The version is in `VERSION`; `install.ps1 -Verify` shows the installed and available versions.
 
+## 3.10.0 — 2026-10-29
+Readable gates and tasks, recorded gate decisions, and Git and generated-client checks. No application source and no setup window changed.
+
+**Audit before the change**
+- The agent has six gates, not eight: G1 Clarification, G2 Gap map, G3 Spec, G4 Plan, G5 Verification, G8 Corporate security. Build, test, and quality checks are part of G5 (section 6); there is no G6 or G7. The proposed G1-G8 titles were therefore mapped onto the real gates, and no gate was added or changed in meaning.
+- Already present and kept: checkpoints and resume (plan section 0 Remaining, `task` statuses, Resume and Modify modes), Git safety (`guard`, never stash/reset/clean, `review` with `git diff --check`), build, coverage, and Sonar evidence, CDMS/DAB profiles and reference implementations.
+
+**Added / changed**
+- `modules\plan\assets\workflow.json`: each gate's title, purpose, activities, deliverable, what to review, and what follows approval, plus the task status vocabulary. People see titles; ids stay in files and logs. Titles can be edited there.
+- `task` output: `gates` (id and title), `nextGate` (the gate waiting for a decision, with its explanation and the choices Approve / Request changes / Custom response), `planTasks` (each plan task's title and status; plans with `todo` / `done` map to Not Started / Completed), `approvals` (latest decisions).
+- `decide -Id <PBI> -Gate G2|G3|G4 -Decision approve|changes|custom [-Text ...]`: records the decision in the task's `approvals.jsonl` (gate id and title, choice, feedback with secrets redacted, user, time, SHA-256 of the document) and writes the status line. Refuses a second approval, an approval before the earlier gate, an approval after changes were requested and before the revision is presented (`ALREADY_APPROVED`, `OUT_OF_ORDER`, `NEEDS_REVISION`), and a decision on a gate with no deliverable.
+- `branchinfo`: staged, unstaged, untracked, conflicted files, and a merge, rebase, cherry-pick, or revert in progress.
+- `review`: an empty generated `.cs` file is an error (`generated-empty`).
+- Agent: gates presented by title with the three choices; ambiguous replies are never approval; tasks named by title; statuses Not Started / In Progress / Implemented - Verification Pending / Blocked / Verified / Completed with implementation and verification kept apart; a later message never restarts a Verified or Completed task; stop on a merge in progress or conflicts; generated GraphQL clients checked at the baseline and regenerated, never resolved by taking one side; `restore` added to the Git commands never run without a request.
+- Plan template: descriptive task title, an Objective column, and the new statuses.
+
+**Fixed during the work:** the new `-Decision` parameter shared its name with `branchuse`'s `$decision` variable (PowerShell names ignore case), which made `branchuse` fail; the parameter variable is now `$GateDecision` with the alias `-Decision`.
+
+**Tests:** 13 new checks (workflow file, gate titles on an old task, pending gate, plan task titles and old statuses, `decide` refusals, request-changes cycle, approval record and redaction, resume, merge and conflict state, empty generated client and conflict markers, agent wording). Result 2026-10-29: 370 passed, 0 failed; window tests (`test-gui.ps1`) 14 passed, 0 failed. Run from Windows PowerShell: started from another shell (Git Bash here), the unreadable-folder check cannot lock its folder and fails.
+
+**NOT VERIFIED:** how Copilot presents the choices in a live session (`benchmark/agent-evaluations.md` 28-35); PBI 305912 on the DAB and CDMS repositories, the installed agent at `C:\Users\RGA\.akzo-agent`, and StrawberryShake generation, none of which are on this machine.
+
 ## 3.9.0 — 2026-10-28
 Setup: repository management, installation status, and agent discovery. No application source and no SDD workflow, skill, or profile changed.
 

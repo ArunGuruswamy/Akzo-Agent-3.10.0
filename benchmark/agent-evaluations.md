@@ -1,4 +1,4 @@
-# Agent evaluations (3.9.0)
+# Agent evaluations (3.10.0)
 
 Akzo SDD Agent — Developed and maintained by Arun RG
 
@@ -55,3 +55,17 @@ reads this file.
 | # | Case | Prompt | Expected behavior | Evidence |
 |---|---|---|---|---|
 | 27 | SonarCloud S1200 | "S1200 in CreatePaintSystemHandler.cs: class coupled to 32 types, maximum 30" | Fix Issue mode with the Refactor rules; no architecture documents read first; locates the handler and its tests; lists the referenced types; removes at least two by reusing existing services; no previously removed collaborator recreated (`git log --diff-filter=D`); no new collaborator only to move the count; creation behavior unchanged; build and focused tests run; Sonar "not verified" unless a Sonar source confirms it | Live, NOT VERIFIED (repository not on this machine) |
+
+## Readable gates, approvals, and progress (3.10.0)
+The helper side of each case is automated in `scripts\test.ps1` (workflow, `decide`, `planTasks`, `branchinfo`, `review`). Whether Copilot presents and follows them is a live check.
+
+| # | Case | Prompt | Expected behavior | Evidence |
+|---|---|---|---|---|
+| 28 | Gate by name | A PBI in Gated mode, up to the gap map | Heading "Existing Code Analysis & Gap Assessment", what was produced, what to review, what follows; Approve / Request changes / Custom response as options; no "G2" needed | Live |
+| 29 | Request changes | Choose Request changes with a correction | `decide ... -Decision changes`; the gap map is revised, set to Draft, and shown again; not approved | Automated (helper); agent live |
+| 30 | Ambiguous reply | Answer a gate with "ok" or "continue" | Not approval; the same choice is asked again | Live |
+| 31 | Task names | Progress after plan approval | "Starting <task title>: <what and why>", never "T2" alone; statuses Implemented - Verification Pending / Verified kept apart | Live |
+| 32 | Repeated message after completion | "continue" after the handover | Nothing redone; Remaining and task statuses read back | Automated (statuses read back); agent live |
+| 33 | Merge in progress | A repository in the middle of a merge | `branchinfo` reports the merge and conflicted files; the agent stops before editing | Automated (helper); agent live |
+| 34 | Empty generated GraphQL client | A zero-byte `*.Generated.cs` | `review` error `generated-empty`; regenerated with the repository's command, reported as a baseline failure | Automated (helper); live with a real StrawberryShake repository NOT VERIFIED (none on this machine) |
+| 35 | PBI 305912 regression scenario | Adaptation Imitation Request and Paint System on the DAB repository | Gates by name, CDMS reference compared before rules are copied, GraphQL client checked first | NOT VERIFIED: the DAB and CDMS repositories are not on this machine |

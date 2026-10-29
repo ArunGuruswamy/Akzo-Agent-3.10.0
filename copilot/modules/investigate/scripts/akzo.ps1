@@ -47,7 +47,7 @@
 #>
 param(
     [Parameter(Position = 0, Mandatory = $true)]
-    [ValidateSet('home', 'registry', 'state', 'inbox', 'pick', 'intake', 'attach', 'role', 'discover', 'task', 'graph', 'sonar', 'coverage', 'remember', 'forget', 'context', 'policy', 'authorize', 'guard', 'scan', 'security', 'purge', 'branchinfo', 'branchcreate', 'branchuse', 'tasks', 'snapshot', 'profile', 'review', 'affected', 'guidance')]
+    [ValidateSet('home', 'registry', 'state', 'inbox', 'pick', 'intake', 'attach', 'role', 'discover', 'task', 'graph', 'sonar', 'coverage', 'remember', 'forget', 'context', 'policy', 'authorize', 'guard', 'scan', 'security', 'purge', 'branchinfo', 'branchcreate', 'branchuse', 'tasks', 'snapshot', 'profile', 'review', 'affected', 'guidance', 'decide')]
     [string]$Command,
     [string]$Reference,       # authorize: the approval you hold (ticket, policy, or approver)
     [string]$Classification,  # authorize: public | internal | confidential (restricted needs an administrator policy)
@@ -93,7 +93,12 @@ param(
     [switch]$Update,
     [string]$Query,
     [ValidateSet('', 'fix', 'refactor', 'new', 'review')]
-    [string]$Task = ''     # profile: the kind of work; fix and refactor load only source grounding and the Sonar rules (refactor adds topic matches)
+    [string]$Task = '',    # profile: the kind of work; fix and refactor load only source grounding and the Sonar rules (refactor adds topic matches)
+    [ValidateSet('', 'G2', 'G3', 'G4')]
+    [string]$Gate = '',    # decide: the gate the developer decided on
+    [ValidateSet('', 'approve', 'changes', 'custom')]
+    [Alias('Decision')]   # not $Decision: PowerShell names are case-insensitive and branchuse assigns $decision
+    [string]$GateDecision = '' # decide: the choice the developer made (never inferred from an ambiguous reply)
 )
 $ErrorActionPreference = 'Stop'
 if ($Rest -and $Command -ne 'guard') { throw "Unexpected argument(s) for '$Command': $($Rest -join ' ')" }   # stray arguments stay an error everywhere but guard
@@ -1195,6 +1200,46 @@ function Get-TaskSummary($t) {
         plan = $plan; completed = [bool]($plan -match '(?i)^done'); branch = "$($t.json.branch)"; specDir = $sd; modified = $t.modified.ToString('yyyy-MM-dd HH:mm')
     }
 }
+# Workflow names (modules\plan\assets\workflow.json): people see gate and task titles; ids stay in files and logs.
+function Read-Workflow {
+    $f = Join-Path $ModulesDir 'plan\assets\workflow.json'
+    try { Get-Content -LiteralPath $f -Raw -Encoding UTF8 | ConvertFrom-Json } catch { throw "Workflow configuration $f is missing or not valid JSON: $($_.Exception.Message)" }
+}
+function Get-TaskStatusLabel($wf, [string]$raw) {   # plan status cell -> user-facing label; old plans (todo / done) map too
+    $v = $raw.Trim()
+    foreach ($st in @($wf.taskStatuses)) { if ($v -match "(?i)$($st.match)") { return $st.label } }
+    if ($v) { $v } else { 'Not Started' }
+}
+function Get-PlanTasks([string]$plan, $wf) {   # rows of plan section 2: id, descriptive title, status label (and the raw cell when it says more)
+    if (-not (Test-Path -LiteralPath $plan) -or (Get-StatusLine $plan 'Status') -eq 'not started') { return @() }
+    foreach ($l in [IO.File]::ReadAllLines($plan)) {
+        if ($l -notmatch '^\|\s*(T\d+)\s*\|') { continue }
+        $c = @($l.Trim().Trim('|').Split('|') | ForEach-Object { $_.Trim() })
+        $raw = "$(@($c | Where-Object { $_ }) | Select-Object -Last 1)"
+        if ($c.Count -lt 3 -or $raw -eq $c[0]) { $raw = '' }
+        $label = Get-TaskStatusLabel $wf $raw
+        $row = [ordered]@{ id = $c[0]; title = $(if ($c[1]) { $c[1] } else { '(no title: name this task in plan.md)' }); status = $label }
+        if ($raw -and $raw -notmatch "(?i)^$([regex]::Escape($label))$" -and $raw -notmatch '(?i)^(todo|done)$') { $row.detail = $raw }
+        [pscustomobject]$row
+    }
+}
+function Get-GateView([string]$specDir, $wf) {   # gate titles with the status of the document each gate approves
+    $gates = foreach ($g in @($wf.gates)) {
+        $row = [ordered]@{ id = $g.id; title = $g.title }
+        if ($g.document) { $row.status = Get-StatusLine (Join-Path $specDir $g.document) $g.key }
+        [pscustomobject]$row
+    }
+    $next = $gates | Where-Object { "$($_.status)" -match '(?i)^(draft|in review|changes requested)' } | Select-Object -First 1
+    $detail = if ($next) { $g = @($wf.gates) | Where-Object { $_.id -eq $next.id }
+        [pscustomobject][ordered]@{ id = $g.id; title = $g.title; status = $next.status; purpose = $g.purpose; deliverable = $g.deliverable; review = $g.review; afterApproval = $g.afterApproval
+            choices = @('Approve', 'Request changes', 'Custom response') } } else { $null }
+    @{ gates = @($gates); next = $detail }
+}
+function Read-Approvals([string]$taskDir) {
+    $f = Join-Path $taskDir 'approvals.jsonl'
+    if (-not (Test-Path -LiteralPath $f)) { return @() }
+    @(foreach ($l in [IO.File]::ReadAllLines($f)) { if ($l.Trim()) { try { $l | ConvertFrom-Json } catch { } } })
+}
 function Update-TaskJson([string]$dir, [hashtable]$set) {   # merge keys into task.json; other keys are kept
     $f = Join-Path $dir 'task.json'
     $o = if (Test-Path -LiteralPath $f) { try { Get-Content -LiteralPath $f -Raw -Encoding UTF8 | ConvertFrom-Json } catch { [pscustomobject]@{} } } else { [pscustomobject]@{} }
@@ -1239,6 +1284,9 @@ function Get-BranchInfo($r, [string]$pbiId, [string]$title) {
     $cur = "$(Invoke-Quiet git -C $root symbolic-ref --short -q HEAD)"   # empty when detached
     $head = "$(Invoke-Quiet git -C $root log -1 '--format=%h %s')"
     $dirty = @(Invoke-Quiet git -C $root -c core.quotepath=off status --porcelain=v1)
+    $op = @(foreach ($m in @{ 'MERGE_HEAD' = 'merge'; 'rebase-merge' = 'rebase'; 'rebase-apply' = 'rebase'; 'CHERRY_PICK_HEAD' = 'cherry-pick'; 'REVERT_HEAD' = 'revert' }.GetEnumerator()) {
+            $gp = "$(Invoke-Quiet git -C $root rev-parse --git-path $m.Key)"
+            if ($gp -and (Test-Path -LiteralPath $(if ([IO.Path]::IsPathRooted($gp)) { $gp } else { Join-Path $root $gp }))) { $m.Value } }) | Select-Object -Unique
     $refs = @(Invoke-Quiet git -C $root for-each-ref '--format=%(refname)' refs/heads refs/remotes)
     $local = @($refs | Where-Object { $_ -like 'refs/heads/*' } | ForEach-Object { $_.Substring(11) })
     $remote = @($refs | Where-Object { $_ -like 'refs/remotes/*' -and $_ -notlike '*/HEAD' } | ForEach-Object { $_.Substring(13) })
@@ -1265,6 +1313,9 @@ function Get-BranchInfo($r, [string]$pbiId, [string]$title) {
     [pscustomobject][ordered]@{
         repo = $r.id; path = $root; branch = $(if ($cur) { $cur } else { '(detached HEAD)' }); head = $head; commits = [bool]$head
         uncommitted = $dirty.Count; uncommittedPaths = @($dirty | Select-Object -First 15)
+        staged = @($dirty | Where-Object { $_ -match '^[MADRCTU]' }).Count; unstaged = @($dirty | Where-Object { $_ -match '^.[MDTU]' }).Count
+        untracked = @($dirty | Where-Object { $_ -like '[?][?]*' }).Count; conflicted = @($dirty | Where-Object { $_ -match '^(U.|.U|AA|DD) ' } | ForEach-Object { $_.Substring(3) })
+        operationInProgress = $(if ($op) { @($op) -join ', ' } else { '' })
         integrationBranch = $isIntegration; recordedForPbis = $recordedFor; recordedForThisPbi = $forThis
         recommend = $recommend; reason = $reason
         defaultBase = $(if ($bases.Count) { $bases[0] } else { '' }); baseCandidates = $bases; baseNote = 'Confirm the base branch with the developer; do not assume it.'
@@ -1627,6 +1678,9 @@ function Get-ReviewFindings($r, $def, [string]$against) {
             if ($l -match 'throw\s+new\s+NotImplementedException|\b(TODO|FIXME)\b|\bPLACEHOLDER\b|<Your\w*>|\{\{\s*\w+\s*\}\}') { & $add 'placeholder' 'error' $p $n 'Placeholder or unfinished code in a change that is about to be reviewed.' '' }
             if ($rules.broadCatch -and $l -match 'catch\s*\(\s*(System\.)?Exception\b|^\s*catch\s*(\{|$)') { & $add 'broad-catch' "$($rules.broadCatch)" $p $n 'Catches every exception; catch only what this code handles, as sibling code at this layer does.' '' }
         }
+    }
+    foreach ($p in @($all | Where-Object { $_ -match '(?i)\.cs$' -and $_ -match $genRx -and $_ -notmatch '(?i)(^|/)(bin|obj)/' })) {
+        if ((Get-Item -LiteralPath (Join-Path $root $p)).Length -eq 0) { & $add 'generated-empty' 'error' $p 0 'Generated file is empty: code generation failed or was interrupted. Rerun the repository''s generation command and build; never hand-edit or pick a side of a generated file.' '' }
     }
     foreach ($c in @(Invoke-Quiet git -C $root -c core.quotepath=off diff --check $against)) {
         if ($c -match '^(.+?):(\d+):\s*(.+)$') { & $add 'diff-check' 'error' $Matches[1] ([int]$Matches[2]) "git diff --check: $($Matches[3])" '' }
@@ -2450,6 +2504,50 @@ if ($Command -eq 'review') {
     exit 0
 }
 
+# decide: the developer's choice at a gate (Approve, Request changes, Custom response). Appends to the task's
+# approvals.jsonl and, for approve and changes, rewrites the gate's status line. Never infers a decision.
+if ($Command -eq 'decide') {
+    if (-not $Id -or -not $Gate -or -not $GateDecision) { throw 'decide needs -Id <PBI> -Gate G2|G3|G4 -Decision approve|changes|custom (and -Text for changes and custom).' }
+    if ($GateDecision -ne 'approve' -and -not $Text) { throw "decide -Decision $GateDecision needs -Text with the developer's words." }
+    $dir = Find-TaskDir $Id $Repo
+    $j = try { Get-Content -LiteralPath (Join-Path $dir 'task.json') -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $null }
+    $sd = if ($j.specDir) { "$($j.specDir)" } else { $dir }
+    $wf = Read-Workflow
+    $g = @($wf.gates) | Where-Object { $_.id -eq $Gate } | Select-Object -First 1
+    $doc = Join-Path $sd $g.document
+    $now = Get-StatusLine $doc $g.key
+    $out = [ordered]@{ id = $Id; gate = $Gate; title = $g.title; decision = $GateDecision; previousStatus = $now }
+    $order = @($wf.gates | Where-Object { $_.document })
+    $prev = $order | Select-Object -Index ([math]::Max(0, [array]::IndexOf(@($order | ForEach-Object { $_.id }), $Gate) - 1))
+    $prevStatus = if ($prev.id -ne $Gate) { Get-StatusLine (Join-Path $sd $prev.document) $prev.key } else { '' }
+    $refuse = if ($now -in 'no file', 'not started') { 'NOTHING_TO_DECIDE', "$($g.title) has no deliverable yet ($($g.document): $now)." }
+        elseif ($GateDecision -eq 'approve' -and $now -match '(?i)^changes requested') { 'NEEDS_REVISION', "Changes were requested for $($g.title); revise $($g.document), set its $($g.key) back to Draft, and present it again before approval." }
+        elseif ($GateDecision -eq 'approve' -and $now -match '(?i)^(approved|waived)') { 'ALREADY_APPROVED', "$($g.title) is already $now; nothing was recorded twice." }
+        elseif ($GateDecision -eq 'approve' -and $prevStatus -match '(?i)^(draft|changes requested)') { 'OUT_OF_ORDER', "$($prev.title) ($prevStatus) must be approved before $($g.title)." }
+        else { $null }
+    if ($refuse) { $out.status = $refuse[0]; $out.message = $refuse[1]; [pscustomobject]$out | ConvertTo-Json -Depth 3; exit 0 }
+    $who = $env:USERNAME; $day = (Get-Date).ToString('yyyy-MM-dd')
+    $sha = (Get-FileHash -LiteralPath $doc -Algorithm SHA256).Hash.ToLowerInvariant()   # the version the developer decided on
+    $new = switch ($GateDecision) { 'approve' { "Approved (by $who, $day)" } 'changes' { "Changes requested (by $who, $day)" } default { $now } }
+    if ($new -ne $now) {
+        $text = [IO.File]::ReadAllText($doc)
+        $text = ([regex]"(?m)^$([regex]::Escape($g.key)):[^\r\n]*").Replace($text, "$($g.key): $new", 1)
+        Write-TextAtomic $doc $text
+    }
+    $rec = [pscustomobject][ordered]@{ at = (Get-Date).ToString('s'); pbi = $Id; gate = $Gate; title = $g.title; decision = $GateDecision; by = $who
+        feedback = $(if ($Text) { Protect-Text $Text } else { '' }); document = $g.document; sha256 = $sha; status = $new }
+    [IO.File]::AppendAllText((Join-Path $dir 'approvals.jsonl'), ($rec | ConvertTo-Json -Compress) + "`n", $Utf8NoBom)
+    $after = Get-GateView $sd $wf
+    $out.status = 'RECORDED'; $out.newStatus = $new; $out.record = $rec
+    $out.next = switch ($GateDecision) {
+        'approve' { $n = @($wf.gates) | Select-Object -Index ([array]::IndexOf(@($wf.gates | ForEach-Object { $_.id }), $Gate) + 1); "Continue with the work that leads to $($n.title)." }
+        'changes' { "Revise $($g.document) as asked, set its $($g.key) to Draft, and present $($g.title) again." }
+        default { 'Act on the instruction; the gate status is unchanged and nothing was approved.' } }
+    $out.gates = $after.gates
+    [pscustomobject]$out | ConvertTo-Json -Depth 4
+    exit 0
+}
+
 switch ($Command) {
     'inbox' {
         New-Item -ItemType Directory -Force -Path $InboxDir | Out-Null
@@ -2618,6 +2716,13 @@ switch ($Command) {
         $info.planStatus = & $statusOf $plan
         $gapLine = (Select-String -LiteralPath $info.spec -Pattern '^Gap map:' -ErrorAction SilentlyContinue | Select-Object -First 1).Line
         $info.gapMapStatus = $(if ($gapLine -and $gapLine -notmatch '\|') { ($gapLine -replace '^Gap map:\s*').Trim() } else { 'not started' })
+        $wf = Read-Workflow
+        $gv = Get-GateView $artifacts $wf
+        # Compact: titles only (the statuses are gapMapStatus, specStatus, planStatus); lists only when they have rows.
+        $info.gates = (@($gv.gates | ForEach-Object { "$($_.id) $($_.title)" }) -join '; ')
+        if ($gv.next) { $info.nextGate = $gv.next }
+        $pt = @(Get-PlanTasks $plan $wf); if ($pt.Count) { $info.planTasks = $pt }
+        $ap = @(Read-Approvals $dir | Select-Object -Last 5); if ($ap.Count) { $info.approvals = $ap }
         $info.evidence = $evidence; $info.created = $created
         $info.git = [ordered]@{
             branch = (Invoke-Quiet git -C $r.path rev-parse --abbrev-ref HEAD); head = (Invoke-Quiet git -C $r.path rev-parse HEAD)
